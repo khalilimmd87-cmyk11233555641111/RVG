@@ -4,7 +4,7 @@ import os
 import hashlib
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 from collections import deque, defaultdict
 
@@ -46,7 +46,7 @@ error_logs: deque = deque(maxlen=50)
 hourly_traffic: dict = defaultdict(int)
 http_client: httpx.AsyncClient | None = None
 
-# لینک‌های ساخته‌شده توسط کاربران: uuid -> {label, limit_bytes(0=unlimited), used_bytes, created_at, active}
+# لینک‌های ساخته‌شده توسط کاربران
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
 
@@ -61,7 +61,7 @@ AUTH = {
     "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "123456")),
 }
 
-SESSIONS: dict = {}  # token -> expiry_timestamp
+SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
 
@@ -144,6 +144,17 @@ def generate_vless_link(uuid: str, host: str, remark: str = "RVG-Railway") -> st
     return f"vless://{uuid}@{host}:443?{query}#{quote(remark)}"
 
 
+def generate_subscription_content(links: list, host: str) -> str:
+    """Generate base64-encoded subscription content with all active links"""
+    import base64
+    lines = []
+    for link_data in links:
+        if link_data.get("active", True):
+            lines.append(link_data["vless_link"])
+    content = "\n".join(lines)
+    return base64.b64encode(content.encode()).decode()
+
+
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
     h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
@@ -161,6 +172,18 @@ def parse_size_to_bytes(value: float, unit: str) -> int:
     return int(value)
 
 
+def is_link_expired(link: dict) -> bool:
+    """Check if a link has passed its expiry date"""
+    expires_at = link.get("expires_at")
+    if not expires_at:
+        return False
+    try:
+        exp = datetime.fromisoformat(expires_at)
+        return datetime.now() > exp
+    except Exception:
+        return False
+
+
 # ───────── Default link (auto-created on first request) ─────────
 async def ensure_default_link():
     async with LINKS_LOCK:
@@ -168,10 +191,13 @@ async def ensure_default_link():
             uid = generate_uuid("default")
             LINKS[uid] = {
                 "label": "لینک پیش‌فرض",
-                "limit_bytes": 0,  # unlimited
+                "limit_bytes": 0,
                 "used_bytes": 0,
                 "created_at": datetime.now().isoformat(),
                 "active": True,
+                "expires_at": None,
+                "tags": [],
+                "note": "",
             }
 
 
@@ -180,7 +206,7 @@ async def ensure_default_link():
 async def root():
     return {
         "service": "RVG Gateway – codebox",
-        "version": "6.0",
+        "version": "7.0",
         "status": "active",
         "channel": "https://t.me/CodeBoxo",
         "host": get_host(),
@@ -190,6 +216,48 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok", "connections": len(connections), "uptime": uptime()}
+
+
+# ───────── Subscription endpoint ─────────
+@app.get("/sub/{uuid}")
+async def subscription_single(uuid: str):
+    """Single-link subscription URL"""
+    import base64
+    async with LINKS_LOCK:
+        link = LINKS.get(uuid)
+    if not link or not link.get("active") or is_link_expired(link):
+        raise HTTPException(status_code=404, detail="link not found or inactive")
+    host = get_host()
+    vless = generate_vless_link(uuid, host, remark=f"RVG-{link['label']}")
+    content = base64.b64encode(vless.encode()).decode()
+    return Response(
+        content=content,
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="sub.txt"',
+            "profile-title": link["label"],
+            "support-url": "https://t.me/CodeBoxo",
+        }
+    )
+
+
+@app.get("/sub-all")
+async def subscription_all(_=Depends(require_auth)):
+    """All active links as subscription (admin only)"""
+    host = get_host()
+    async with LINKS_LOCK:
+        links_data = [
+            {
+                "vless_link": generate_vless_link(uid, host, remark=f"RVG-{d['label']}"),
+                "active": d.get("active", True),
+                "expired": is_link_expired(d),
+            }
+            for uid, d in LINKS.items()
+        ]
+    import base64
+    lines = [l["vless_link"] for l in links_data if l["active"] and not l["expired"]]
+    content = base64.b64encode("\n".join(lines).encode()).decode()
+    return Response(content=content, media_type="text/plain")
 
 
 # ───────── Auth Endpoints ─────────
@@ -242,7 +310,6 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
 
     AUTH["password_hash"] = hash_password(new)
 
-    # همه سشن‌های دیگر را باطل می‌کنیم، فقط سشن فعلی باقی می‌ماند
     current_token = request.cookies.get(SESSION_COOKIE)
     async with SESSIONS_LOCK:
         SESSIONS.clear()
@@ -252,10 +319,13 @@ async def api_change_password(request: Request, _=Depends(require_auth)):
     return {"ok": True}
 
 
-# ───────── Stats / Links / Proxy (protected) ─────────
+# ───────── Stats ─────────
 @app.get("/stats")
 async def get_stats(_=Depends(require_auth)):
     now = datetime.now()
+    async with LINKS_LOCK:
+        links_snapshot = dict(LINKS)
+
     return {
         "active_connections": len(connections),
         "total_traffic_mb": round(stats["total_bytes"] / (1024 * 1024), 2),
@@ -266,6 +336,8 @@ async def get_stats(_=Depends(require_auth)):
         "hourly": dict(hourly_traffic),
         "recent_errors": list(error_logs)[-10:],
         "links_count": len(LINKS),
+        "active_links": sum(1 for l in links_snapshot.values() if l.get("active") and not is_link_expired(l)),
+        "expired_links": sum(1 for l in links_snapshot.values() if is_link_expired(l)),
     }
 
 
@@ -276,10 +348,18 @@ async def create_link(request: Request, _=Depends(require_auth)):
     label = (body.get("label") or "لینک جدید").strip()[:60]
     limit_value = float(body.get("limit_value") or 0)
     limit_unit = body.get("limit_unit") or "GB"
+    expires_days = body.get("expires_days")  # None = no expiry
+    note = (body.get("note") or "").strip()[:200]
+    tags = body.get("tags") or []
 
     limit_bytes = 0 if limit_value <= 0 else parse_size_to_bytes(limit_value, limit_unit)
 
-    uid = generate_uuid()  # کاملا رندوم
+    # Calculate expiry date
+    expires_at = None
+    if expires_days and int(expires_days) > 0:
+        expires_at = (datetime.now() + timedelta(days=int(expires_days))).isoformat()
+
+    uid = generate_uuid()
     async with LINKS_LOCK:
         LINKS[uid] = {
             "label": label,
@@ -287,6 +367,9 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "used_bytes": 0,
             "created_at": datetime.now().isoformat(),
             "active": True,
+            "expires_at": expires_at,
+            "note": note,
+            "tags": tags[:5],
         }
 
     host = get_host()
@@ -297,7 +380,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "used_bytes": 0,
         "active": True,
         "created_at": LINKS[uid]["created_at"],
+        "expires_at": expires_at,
+        "note": note,
+        "tags": tags,
         "vless_link": generate_vless_link(uid, host, remark=f"RVG-{label}"),
+        "sub_url": f"https://{host}/sub/{uid}",
     }
 
 
@@ -314,7 +401,12 @@ async def list_links(_=Depends(require_auth)):
                 "used_bytes": data["used_bytes"],
                 "active": data["active"],
                 "created_at": data["created_at"],
+                "expires_at": data.get("expires_at"),
+                "note": data.get("note", ""),
+                "tags": data.get("tags", []),
+                "expired": is_link_expired(data),
                 "vless_link": generate_vless_link(uid, host, remark=f"RVG-{data['label']}"),
+                "sub_url": f"https://{host}/sub/{uid}",
             })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -336,14 +428,20 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
             LINKS[uid]["used_bytes"] = 0
         if "label" in body:
             LINKS[uid]["label"] = str(body["label"])[:60]
+        if "expires_at" in body:
+            LINKS[uid]["expires_at"] = body["expires_at"]
+        if "note" in body:
+            LINKS[uid]["note"] = str(body["note"])[:200]
     return {"ok": True}
 
 
 @app.delete("/api/links/{uid}")
 async def delete_link(uid: str, _=Depends(require_auth)):
     async with LINKS_LOCK:
-        LINKS.pop(uid, None)
-    return {"ok": True}
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        del LINKS[uid]
+    return {"ok": True, "deleted": uid}
 
 
 # ───────── VLESS Protocol Relay ─────────
@@ -355,13 +453,13 @@ async def parse_vless_header(first_chunk: bytes):
         raise ValueError("chunk too small for VLESS header")
 
     pos = 0
-    version = first_chunk[pos]; pos += 1          # noqa: E702
-    req_uuid = first_chunk[pos:pos + 16]; pos += 16  # noqa: E702
+    version = first_chunk[pos]; pos += 1
+    req_uuid = first_chunk[pos:pos + 16]; pos += 16
 
     addon_len = first_chunk[pos]; pos += 1
     pos += addon_len
 
-    command = first_chunk[pos]; pos += 1  # noqa: E702
+    command = first_chunk[pos]; pos += 1
     port = int.from_bytes(first_chunk[pos:pos + 2], "big"); pos += 2
 
     addr_type = first_chunk[pos]; pos += 1
@@ -389,12 +487,14 @@ def format_link_uuid(raw16: bytes) -> str:
 
 
 async def check_quota(uid: str, extra_bytes: int) -> bool:
-    """True اگر اجازه عبور دارد (سهمیه تمام نشده)."""
     async with LINKS_LOCK:
         link = LINKS.get(uid)
         if link is None:
-            return True  # لینک ناشناس → اجازه (بک‌ورد کامپتیبیلیتی)
+            return True  # unknown link → allow (backward compat)
         if not link["active"]:
+            return False
+        # FIX: Check expiry
+        if is_link_expired(link):
             return False
         if link["limit_bytes"] == 0:
             return True
@@ -482,7 +582,6 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
 
     writer = None
     try:
-        # بررسی سهمیه پیش از شروع
         if not await check_quota(uuid, 0):
             await websocket.close(code=1008, reason="quota exceeded or link disabled")
             return
@@ -593,119 +692,267 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ورود · RVG Gateway</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --blue-50:#E6F1FB;--blue-100:#B5D4F4;--blue-200:#85B7EB;
-  --blue-300:#5BA3E8;--blue-400:#378ADD;--blue-500:#2570C2;
-  --blue-600:#185FA5;--blue-700:#11518F;--blue-800:#0C447C;--blue-900:#042C53;
-  --red-bg:#FCEBEB;--red-text:#A32D2D;
-  --border:#CFE3F7;--bg:#EEF5FE;--text-1:#042C53;
+  --bg-deep:#030d1a;
+  --bg-mid:#061527;
+  --accent:#3B82F6;
+  --accent-glow:rgba(59,130,246,0.4);
+  --accent-dim:rgba(59,130,246,0.15);
+  --text-bright:#E8F4FF;
+  --text-mid:#7BAED4;
+  --text-dim:#3D6B8E;
+  --border:rgba(59,130,246,0.2);
+  --border-focus:rgba(59,130,246,0.6);
+  --card-bg:rgba(6,21,39,0.85);
+  --input-bg:rgba(3,13,26,0.7);
+  --red:#EF4444;
+  --red-dim:rgba(239,68,68,0.1);
 }
-html,body{height:100%}
+html,body{height:100%;overflow:hidden}
 body{
   font-family:'Vazirmatn',sans-serif;
-  background:linear-gradient(135deg,var(--blue-900) 0%,#06335e 60%,var(--blue-700) 100%);
-  min-height:100vh;display:flex;align-items:center;justify-content:center;
-  padding:20px;color:var(--text-1);
+  background:var(--bg-deep);
+  min-height:100vh;
+  display:flex;align-items:center;justify-content:center;
+  padding:20px;
+  position:relative;
 }
+
+/* Animated bg */
+.bg-canvas{
+  position:fixed;inset:0;z-index:0;
+  background:radial-gradient(ellipse 80% 60% at 50% -10%, rgba(59,130,246,0.12) 0%, transparent 70%),
+             radial-gradient(ellipse 50% 40% at 80% 80%, rgba(16,185,129,0.05) 0%, transparent 60%),
+             var(--bg-deep);
+}
+.grid-lines{
+  position:fixed;inset:0;z-index:0;
+  background-image:
+    linear-gradient(rgba(59,130,246,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(59,130,246,0.04) 1px, transparent 1px);
+  background-size:40px 40px;
+}
+.orb{
+  position:fixed;border-radius:50%;filter:blur(80px);z-index:0;
+  animation:float 8s ease-in-out infinite;
+}
+.orb-1{width:400px;height:400px;background:rgba(59,130,246,0.06);top:-100px;right:-100px;animation-delay:0s}
+.orb-2{width:300px;height:300px;background:rgba(16,185,129,0.04);bottom:-50px;left:-50px;animation-delay:3s}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-20px)}}
+
+/* Card */
+.login-wrap{position:relative;z-index:10;width:100%;max-width:400px}
 .login-card{
-  background:#fff;border-radius:18px;padding:34px 30px;
-  width:100%;max-width:380px;box-shadow:0 16px 50px rgba(4,44,83,0.35);
+  background:var(--card-bg);
+  border:1px solid var(--border);
+  border-radius:20px;
+  padding:38px 34px 34px;
+  backdrop-filter:blur(20px);
+  box-shadow:
+    0 0 0 1px rgba(59,130,246,0.05),
+    0 20px 60px rgba(0,0,0,0.5),
+    0 0 80px rgba(59,130,246,0.06);
 }
-.login-logo{display:flex;align-items:center;gap:12px;margin-bottom:22px}
-.login-logo img{width:46px;height:46px;border-radius:12px;object-fit:cover;border:1px solid var(--border)}
-.login-logo-name{font-size:16px;font-weight:700;color:var(--blue-900)}
-.login-logo-sub{font-size:11px;color:var(--blue-400);margin-top:2px}
-.login-title{font-size:18px;font-weight:700;margin-bottom:6px;color:var(--blue-900)}
-.login-sub{font-size:12.5px;color:var(--blue-400);margin-bottom:22px}
-.form-group{margin-bottom:16px;display:flex;flex-direction:column;gap:7px}
-.form-label{font-size:12px;font-weight:600;color:var(--blue-700)}
-.form-input{
-  padding:12px 14px;border-radius:10px;border:1px solid var(--border);
-  font-family:inherit;font-size:14px;outline:none;background:var(--bg);
-  transition:.15s;color:var(--text-1);
+
+/* Logo */
+.brand{display:flex;align-items:center;gap:14px;margin-bottom:30px}
+.brand-icon{
+  width:50px;height:50px;border-radius:14px;overflow:hidden;
+  border:1px solid var(--border);
+  box-shadow:0 0 20px var(--accent-glow);
+  flex-shrink:0;
 }
-.form-input:focus{border-color:var(--blue-400);background:#fff}
+.brand-icon img{width:100%;height:100%;object-fit:cover}
+.brand-name{font-size:17px;font-weight:700;color:var(--text-bright);letter-spacing:.01em}
+.brand-sub{font-size:11px;color:var(--text-dim);margin-top:3px;font-weight:400}
+
+/* Title */
+.login-heading{
+  font-size:22px;font-weight:700;color:var(--text-bright);
+  margin-bottom:6px;letter-spacing:-.02em;
+}
+.login-sub{font-size:12.5px;color:var(--text-mid);margin-bottom:26px;line-height:1.6}
+
+/* Form */
+.field{margin-bottom:18px}
+.field-label{
+  font-size:11.5px;font-weight:600;color:var(--text-mid);
+  margin-bottom:8px;display:block;letter-spacing:.02em;text-transform:uppercase;
+}
+.field-input-wrap{position:relative}
+.field-input{
+  width:100%;padding:13px 44px 13px 16px;
+  border-radius:12px;
+  border:1px solid var(--border);
+  background:var(--input-bg);
+  color:var(--text-bright);
+  font-family:inherit;font-size:14px;
+  outline:none;
+  transition:all .2s;
+  letter-spacing:.05em;
+}
+.field-input::placeholder{color:var(--text-dim);letter-spacing:0}
+.field-input:focus{border-color:var(--border-focus);background:rgba(3,13,26,0.9);box-shadow:0 0 0 3px rgba(59,130,246,0.1)}
+.field-icon{
+  position:absolute;left:14px;top:50%;transform:translateY(-50%);
+  color:var(--text-dim);font-size:18px;pointer-events:none;transition:.2s;
+}
+.field-input:focus + .field-icon{color:var(--accent)}
+
+/* Default password hint */
+.default-hint{
+  display:flex;align-items:center;gap:10px;
+  background:rgba(59,130,246,0.06);
+  border:1px solid rgba(59,130,246,0.15);
+  border-radius:10px;
+  padding:10px 14px;
+  margin-bottom:20px;
+}
+.hint-label{font-size:11px;color:var(--text-dim);flex:1}
+.hint-val{
+  font-family:ui-monospace,monospace;
+  font-size:13px;font-weight:700;
+  color:var(--accent);
+  background:rgba(59,130,246,0.1);
+  border:1px solid rgba(59,130,246,0.2);
+  padding:3px 10px;border-radius:6px;
+  cursor:pointer;transition:.15s;letter-spacing:.1em;
+}
+.hint-val:hover{background:rgba(59,130,246,0.2);border-color:var(--accent)}
+
+/* Button */
 .btn-login{
-  width:100%;padding:13px;border-radius:10px;border:none;cursor:pointer;
-  background:var(--blue-600);color:#fff;font-family:inherit;font-size:14px;
-  font-weight:600;display:flex;align-items:center;justify-content:center;gap:8px;
-  transition:.15s;box-shadow:0 4px 14px rgba(24,95,165,0.3);
+  width:100%;padding:14px;
+  border-radius:12px;border:none;cursor:pointer;
+  background:linear-gradient(135deg,#2563EB 0%,#1D4ED8 100%);
+  color:#fff;font-family:inherit;font-size:14px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  transition:all .2s;
+  box-shadow:0 4px 20px rgba(37,99,235,0.4),0 0 0 1px rgba(255,255,255,0.05) inset;
+  position:relative;overflow:hidden;
 }
-.btn-login:hover{background:var(--blue-700)}
-.btn-login:disabled{opacity:.6;cursor:not-allowed}
+.btn-login::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,rgba(255,255,255,0.1) 0%,transparent 60%);
+  opacity:0;transition:.2s;
+}
+.btn-login:hover::before{opacity:1}
+.btn-login:hover{box-shadow:0 6px 28px rgba(37,99,235,0.5)}
+.btn-login:disabled{opacity:.5;cursor:not-allowed}
+.btn-login i{font-size:16px}
+
+/* Error */
 .error-box{
-  background:var(--red-bg);color:var(--red-text);font-size:12.5px;
-  padding:10px 13px;border-radius:9px;margin-bottom:14px;display:none;
+  display:none;
+  background:var(--red-dim);
+  border:1px solid rgba(239,68,68,0.2);
+  border-radius:10px;
+  padding:11px 14px;
+  margin-bottom:16px;
+  font-size:12.5px;color:var(--red);
   align-items:center;gap:8px;
 }
 .error-box.show{display:flex}
-.login-footer{margin-top:22px;text-align:center;font-size:11.5px;color:var(--blue-400)}
-.login-footer a{color:var(--blue-500);text-decoration:none;font-weight:600}
+
+/* Footer */
+.login-footer{
+  margin-top:24px;
+  padding-top:20px;
+  border-top:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  gap:8px;font-size:11.5px;color:var(--text-dim);
+}
+.login-footer a{
+  color:var(--accent);text-decoration:none;font-weight:600;
+  display:flex;align-items:center;gap:4px;transition:.15s;
+}
+.login-footer a:hover{color:var(--text-bright)}
 </style>
 </head>
 <body>
-  <div class="login-card">
-    <div class="login-logo">
-      <img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox">
-      <div>
-        <div class="login-logo-name">codebox</div>
-        <div class="login-logo-sub">RVG Gateway · v6.0</div>
+  <div class="bg-canvas"></div>
+  <div class="grid-lines"></div>
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="brand">
+        <div class="brand-icon">
+          <img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox">
+        </div>
+        <div>
+          <div class="brand-name">codebox</div>
+          <div class="brand-sub">RVG Gateway · v7.0</div>
+        </div>
       </div>
-    </div>
-    <div class="login-title">ورود به پنل مدیریت</div>
-    <div class="login-sub">برای دسترسی به داشبورد، رمز عبور را وارد کنید</div>
 
-    <div class="error-box" id="err-box"><i class="ti ti-alert-circle"></i> <span id="err-text"></span></div>
+      <div class="login-heading">ورود به پنل</div>
+      <div class="login-sub">رمز عبور خود را برای دسترسی به داشبورد وارد کنید</div>
 
-    <form id="login-form">
-      <div class="form-group">
-        <label class="form-label">رمز عبور</label>
-        <input class="form-input" type="password" id="password" placeholder="••••••••" autofocus required>
+      <div class="error-box" id="err-box"><i class="ti ti-alert-circle"></i><span id="err-text"></span></div>
+
+      <div class="default-hint">
+        <span class="hint-label">رمز پیش‌فرض</span>
+        <span class="hint-val" onclick="fillDefault()" title="کلیک برای پر کردن خودکار">123456</span>
       </div>
-      <a>رمز پیش فرض : 123456</a>
-      <button class="btn-login" type="submit" id="login-btn"><i class="ti ti-login-2"></i> ورود</button>
-    </form>
 
-    <div class="login-footer">
-      کانال تلگرام <a href="https://t.me/CodeBoxo" target="_blank" rel="noopener">@CodeBoxo</a>
+      <form id="login-form">
+        <div class="field">
+          <label class="field-label">رمز عبور</label>
+          <div class="field-input-wrap">
+            <input class="field-input" type="password" id="password" placeholder="رمز عبور خود را وارد کنید" autofocus required>
+            <i class="ti ti-lock field-icon"></i>
+          </div>
+        </div>
+        <button class="btn-login" type="submit" id="login-btn">
+          <i class="ti ti-login-2"></i> ورود به داشبورد
+        </button>
+      </form>
+
+      <div class="login-footer">
+        کانال رسمی
+        <a href="https://t.me/CodeBoxo" target="_blank" rel="noopener">
+          <i class="ti ti-brand-telegram"></i> @CodeBoxo
+        </a>
+      </div>
     </div>
   </div>
 
 <script>
+function fillDefault(){
+  document.getElementById('password').value='123456';
+  document.getElementById('password').focus();
+}
+
 const form=document.getElementById('login-form');
 const errBox=document.getElementById('err-box');
 const errText=document.getElementById('err-text');
 const btn=document.getElementById('login-btn');
 
-form.addEventListener('submit', async (e)=>{
+form.addEventListener('submit', async(e)=>{
   e.preventDefault();
   errBox.classList.remove('show');
   btn.disabled=true;
-  btn.innerHTML='<i class="ti ti-loader-2"></i> در حال ورود...';
+  btn.innerHTML='<i class="ti ti-loader-2" style="animation:spin 1s linear infinite"></i> در حال ورود...';
   const password=document.getElementById('password').value;
   try{
-    const r=await fetch('/api/login',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({password})
-    });
-    if(!r.ok){
-      const d=await r.json().catch(()=>({}));
-      throw new Error(d.detail||'خطا در ورود');
-    }
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));throw new Error(d.detail||'خطا در ورود');}
     location.href='/dashboard';
   }catch(err){
     errText.textContent=err.message;
     errBox.classList.add('show');
     btn.disabled=false;
-    btn.innerHTML='<i class="ti ti-login-2"></i> ورود';
+    btn.innerHTML='<i class="ti ti-login-2"></i> ورود به داشبورد';
   }
 });
 </script>
+<style>@keyframes spin{to{transform:rotate(360deg)}}</style>
 </body>
 </html>"""
 
@@ -726,208 +973,338 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>RVG Gateway · codebox</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
-  --blue-50:#E6F1FB;--blue-100:#B5D4F4;--blue-200:#85B7EB;
-  --blue-300:#5BA3E8;--blue-400:#378ADD;--blue-500:#2570C2;
-  --blue-600:#185FA5;--blue-700:#11518F;--blue-800:#0C447C;--blue-900:#042C53;
-  --green-bg:#EAF3DE;--green-text:#3B6D11;--green-dot:#6CA52E;
-  --red-bg:#FCEBEB;--red-text:#A32D2D;--red-dot:#E24B4A;
-  --amber-bg:#FAEEDA;--amber-text:#854F0B;--amber-dot:#D99A2B;
-  --border:#CFE3F7;--bg:#EEF5FE;--white:#fff;
-  --text-1:#042C53;--text-2:#378ADD;--text-3:#85B7EB;
-  --shadow:0 1px 2px rgba(4,44,83,0.04), 0 1px 12px rgba(4,44,83,0.03);
+  --bg:#060f1d;
+  --bg2:#0a1628;
+  --bg3:#0e1e35;
+  --card:#0d1b2e;
+  --card-border:rgba(59,130,246,0.12);
+  --card-border-hover:rgba(59,130,246,0.25);
+  --accent:#3B82F6;
+  --accent-2:#60A5FA;
+  --accent-glow:rgba(59,130,246,0.3);
+  --accent-dim:rgba(59,130,246,0.1);
+  --green:#10B981;--green-bg:rgba(16,185,129,0.1);--green-text:#34D399;
+  --red:#EF4444;--red-bg:rgba(239,68,68,0.1);--red-text:#F87171;
+  --amber:#F59E0B;--amber-bg:rgba(245,158,11,0.1);--amber-text:#FCD34D;
+  --purple:#8B5CF6;--purple-bg:rgba(139,92,246,0.1);
+  --text-1:#E8F4FF;--text-2:#7BAED4;--text-3:#3D6B8E;
+  --sidebar-w:248px;
+  --shadow:0 4px 24px rgba(0,0,0,0.3);
+  --radius:14px;
 }
 html,body{height:100%}
-body{font-family:'Vazirmatn',sans-serif;background:var(--bg);color:var(--text-1);min-height:100vh;display:flex;font-size:14px}
-::-webkit-scrollbar{width:6px;height:6px}
-::-webkit-scrollbar-thumb{background:var(--blue-100);border-radius:3px}
-a{color:inherit}
+body{font-family:'Vazirmatn',sans-serif;background:var(--bg);color:var(--text-1);min-height:100vh;display:flex;font-size:14px;overflow-x:hidden}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--bg3);border-radius:3px}
+a{color:inherit;text-decoration:none}
 
-/* SIDEBAR */
-.sidebar{width:236px;min-height:100vh;background:linear-gradient(180deg,var(--blue-900) 0%,#031f3c 100%);display:flex;flex-direction:column;flex-shrink:0;position:fixed;right:0;top:0;bottom:0;z-index:200;transition:transform .25s ease}
-.logo{display:flex;align-items:center;gap:11px;padding:22px 18px 20px;border-bottom:1px solid rgba(255,255,255,0.06)}
-.logo img{width:42px;height:42px;border-radius:11px;object-fit:cover;border:1px solid rgba(255,255,255,0.1)}
-.logo-name{color:#fff;font-size:15px;font-weight:700;letter-spacing:.01em}
-.logo-sub{color:var(--blue-300);font-size:11px;margin-top:2px}
-.sidebar-close{display:none;position:absolute;left:14px;top:24px;background:rgba(255,255,255,0.06);border:none;color:#fff;width:34px;height:34px;border-radius:9px;font-size:18px;align-items:center;justify-content:center;cursor:pointer}
-.nav-scroll{flex:1;overflow-y:auto;padding-bottom:10px}
-.nav-group-label{color:var(--blue-400);font-size:10px;letter-spacing:.1em;padding:18px 20px 6px;text-transform:uppercase;font-weight:600}
-.nav-item{display:flex;align-items:center;gap:10px;padding:10px 20px;color:var(--blue-200);font-size:13px;cursor:pointer;border-right:3px solid transparent;transition:.15s;user-select:none;position:relative}
-.nav-item i{font-size:18px;width:20px;text-align:center}
-.nav-item:hover{background:rgba(255,255,255,0.04);color:#fff}
-.nav-item.active{background:linear-gradient(90deg,rgba(55,138,221,0.18),rgba(55,138,221,0.02));color:#fff;border-right-color:var(--blue-400)}
-.nav-item .nav-badge{margin-right:auto;background:rgba(55,138,221,0.18);color:var(--blue-200);font-size:10px;padding:2px 7px;border-radius:20px;font-weight:600}
-.sidebar-footer{padding:16px 18px;border-top:1px solid rgba(255,255,255,0.06)}
-.sidebar-footer-label{color:var(--blue-300);font-size:11px;margin-bottom:9px;display:flex;align-items:center;gap:6px}
-.tg-btn{display:flex;align-items:center;justify-content:center;gap:8px;background:linear-gradient(135deg,#0098e6,#0077bb);color:#fff;border-radius:10px;padding:11px;font-size:13px;font-weight:500;font-family:inherit;border:none;cursor:pointer;width:100%;text-decoration:none;transition:.15s;box-shadow:0 4px 14px rgba(0,136,204,0.25)}
-.tg-btn:hover{filter:brightness(1.08)}
-.tg-btn i{font-size:18px}
-.logout-btn{display:flex;align-items:center;justify-content:center;gap:8px;background:rgba(226,75,74,0.12);color:#f0a5a5;border-radius:10px;padding:10px;font-size:12.5px;font-weight:500;font-family:inherit;border:1px solid rgba(226,75,74,0.25);cursor:pointer;width:100%;transition:.15s;margin-top:10px}
-.logout-btn:hover{background:rgba(226,75,74,0.2);color:#fff}
+/* ── SIDEBAR ── */
+.sidebar{
+  width:var(--sidebar-w);min-height:100vh;
+  background:linear-gradient(180deg,var(--bg2) 0%,#071020 100%);
+  border-left:1px solid var(--card-border);
+  display:flex;flex-direction:column;flex-shrink:0;
+  position:fixed;right:0;top:0;bottom:0;z-index:200;
+  transition:transform .25s cubic-bezier(.4,0,.2,1);
+}
+.logo{
+  display:flex;align-items:center;gap:12px;
+  padding:22px 18px 18px;
+  border-bottom:1px solid var(--card-border);
+}
+.logo-img{
+  width:40px;height:40px;border-radius:11px;overflow:hidden;
+  border:1px solid var(--card-border);
+  box-shadow:0 0 16px var(--accent-glow);flex-shrink:0;
+}
+.logo-img img{width:100%;height:100%;object-fit:cover}
+.logo-name{font-size:14px;font-weight:700;color:var(--text-1);letter-spacing:.01em}
+.logo-sub{font-size:10.5px;color:var(--text-3);margin-top:2px}
+.sidebar-close{display:none;position:absolute;left:14px;top:22px;background:var(--accent-dim);border:1px solid var(--card-border);color:var(--text-2);width:32px;height:32px;border-radius:9px;font-size:17px;align-items:center;justify-content:center;cursor:pointer}
+.nav-scroll{flex:1;overflow-y:auto;padding:8px 0 10px}
+.nav-section{padding:16px 16px 4px;font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-3);font-weight:600}
+.nav-item{
+  display:flex;align-items:center;gap:10px;
+  padding:9px 16px;
+  color:var(--text-3);font-size:12.5px;cursor:pointer;
+  border-right:2px solid transparent;
+  transition:all .15s;user-select:none;margin:1px 8px;
+  border-radius:10px;position:relative;
+}
+.nav-item i{font-size:17px;width:19px;text-align:center;flex-shrink:0}
+.nav-item:hover{background:var(--accent-dim);color:var(--text-2)}
+.nav-item.active{background:linear-gradient(135deg,rgba(59,130,246,0.15),rgba(59,130,246,0.05));color:var(--text-1);border-right-color:var(--accent)}
+.nav-badge{margin-right:auto;background:rgba(59,130,246,0.15);color:var(--accent-2);font-size:9.5px;padding:1px 7px;border-radius:20px;font-weight:700}
+.sidebar-footer{padding:14px 16px;border-top:1px solid var(--card-border)}
+.tg-link{display:flex;align-items:center;justify-content:center;gap:8px;background:linear-gradient(135deg,#0098e6,#0077bb);color:#fff;border-radius:10px;padding:10px;font-size:12.5px;font-weight:600;font-family:inherit;border:none;cursor:pointer;width:100%;transition:.15s;box-shadow:0 4px 14px rgba(0,136,204,0.25)}
+.tg-link:hover{filter:brightness(1.1)}
+.tg-link i{font-size:17px}
+.logout-btn{display:flex;align-items:center;justify-content:center;gap:7px;background:var(--red-bg);color:var(--red-text);border-radius:10px;padding:9px;font-size:12px;font-weight:500;font-family:inherit;border:1px solid rgba(239,68,68,0.2);cursor:pointer;width:100%;transition:.15s;margin-top:8px}
+.logout-btn:hover{background:rgba(239,68,68,0.2)}
 
-/* MOBILE TOPBAR + OVERLAY */
-.mobile-topbar{display:none;position:fixed;top:0;right:0;left:0;height:56px;background:linear-gradient(180deg,var(--blue-900) 0%,#06335e 100%);z-index:150;align-items:center;justify-content:space-between;padding:0 14px;box-shadow:0 2px 10px rgba(4,44,83,0.15)}
+/* MOBILE */
+.mobile-topbar{display:none;position:fixed;top:0;right:0;left:0;height:54px;background:var(--bg2);border-bottom:1px solid var(--card-border);z-index:150;align-items:center;justify-content:space-between;padding:0 14px}
 .mobile-topbar .mt-left{display:flex;align-items:center;gap:10px}
-.mobile-topbar .mt-left img{width:32px;height:32px;border-radius:9px;object-fit:cover}
-.mobile-topbar .mt-title{color:#fff;font-size:14px;font-weight:700}
-.menu-btn{background:rgba(255,255,255,0.08);border:none;color:#fff;width:38px;height:38px;border-radius:10px;font-size:19px;display:flex;align-items:center;justify-content:center;cursor:pointer}
-.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(4,44,83,0.45);z-index:190;backdrop-filter:blur(2px)}
+.mobile-topbar .mt-logo{width:30px;height:30px;border-radius:8px;overflow:hidden}
+.mobile-topbar .mt-logo img{width:100%;height:100%;object-fit:cover}
+.mobile-topbar .mt-title{color:var(--text-1);font-size:13.5px;font-weight:700}
+.menu-btn{background:var(--accent-dim);border:1px solid var(--card-border);color:var(--text-2);width:36px;height:36px;border-radius:9px;font-size:18px;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:190;backdrop-filter:blur(4px)}
 .sidebar-overlay.show{display:block}
 
 /* MAIN */
-.main{margin-right:236px;flex:1;padding:26px 28px 50px;max-width:calc(100% - 236px)}
+.main{margin-right:var(--sidebar-w);flex:1;padding:28px 28px 60px;min-width:0}
 .page{display:none}
-.page.active{display:block;animation:fadeIn .25s ease}
-@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.page.active{display:block;animation:fadeIn .2s ease}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 
-.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;flex-wrap:wrap;gap:12px}
-.topbar-title{font-size:20px;font-weight:700;color:var(--blue-900);display:flex;align-items:center;gap:9px}
-.topbar-title i{color:var(--blue-400);font-size:22px}
-.topbar-sub{font-size:12px;color:var(--blue-400);margin-top:4px}
-.topbar-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.badge{font-size:11px;padding:5px 12px;border-radius:20px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+/* TOPBAR */
+.topbar{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px}
+.topbar-title{font-size:19px;font-weight:700;color:var(--text-1);display:flex;align-items:center;gap:9px;letter-spacing:-.02em}
+.topbar-title i{color:var(--accent);font-size:21px}
+.topbar-sub{font-size:11.5px;color:var(--text-3);margin-top:5px}
+.topbar-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+/* BADGES */
+.badge{font-size:10.5px;padding:4px 11px;border-radius:20px;font-weight:600;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
 .badge-green{background:var(--green-bg);color:var(--green-text)}
-.badge-blue{background:var(--blue-50);color:var(--blue-600)}
+.badge-blue{background:var(--accent-dim);color:var(--accent-2)}
 .badge-amber{background:var(--amber-bg);color:var(--amber-text)}
 .badge-red{background:var(--red-bg);color:var(--red-text)}
-.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
-.dot-green{background:var(--green-dot)}
-.dot-red{background:var(--red-dot)}
-.dot-amber{background:var(--amber-dot)}
+.badge-purple{background:var(--purple-bg);color:#A78BFA}
+.dot{width:6px;height:6px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot-green{background:var(--green)}
+.dot-red{background:var(--red)}
+.dot-amber{background:var(--amber)}
+.dot-blue{background:var(--accent)}
 .pulse{animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
-/* METRICS */
-.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
-.metric{background:var(--white);border-radius:14px;border:1px solid var(--border);padding:18px 18px;box-shadow:var(--shadow);transition:.15s}
-.metric:hover{transform:translateY(-2px);box-shadow:0 4px 18px rgba(4,44,83,0.07)}
-.metric-label{font-size:11px;color:var(--blue-400);margin-bottom:9px;display:flex;align-items:center;gap:6px;font-weight:600}
-.metric-label i{font-size:16px}
-.metric-val{font-size:28px;font-weight:700;color:var(--blue-900);line-height:1}
-.metric-unit{font-size:13px;font-weight:500;color:var(--blue-400);margin-right:3px}
-.metric-sub{font-size:11px;color:var(--blue-600);margin-top:6px;display:flex;align-items:center;gap:4px}
-.metric-error .metric-label{color:var(--red-text)}
-.metric-error .metric-val{color:var(--red-dot)}
-.metric-error .metric-sub{color:var(--red-text)}
+/* METRIC CARDS */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
+.metric{
+  background:var(--card);
+  border:1px solid var(--card-border);
+  border-radius:var(--radius);
+  padding:18px 18px 16px;
+  transition:all .2s;
+  position:relative;overflow:hidden;
+}
+.metric::before{content:'';position:absolute;top:0;right:0;width:2px;height:100%;background:var(--accent);opacity:0;transition:.2s}
+.metric:hover{border-color:var(--card-border-hover);transform:translateY(-2px)}
+.metric:hover::before{opacity:1}
+.metric-icon{width:36px;height:36px;border-radius:9px;background:var(--accent-dim);display:flex;align-items:center;justify-content:center;margin-bottom:12px;color:var(--accent);font-size:18px}
+.metric-label{font-size:10.5px;color:var(--text-3);margin-bottom:5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.metric-val{font-size:26px;font-weight:700;color:var(--text-1);line-height:1;letter-spacing:-.02em}
+.metric-unit{font-size:12px;font-weight:500;color:var(--text-3);margin-right:2px}
+.metric-sub{font-size:10.5px;color:var(--text-3);margin-top:7px;display:flex;align-items:center;gap:4px}
+.metric.danger .metric-icon{background:var(--red-bg);color:var(--red)}
+.metric.danger::before{background:var(--red)}
+.metric.success .metric-icon{background:var(--green-bg);color:var(--green)}
+.metric.success::before{background:var(--green)}
 
 /* VLESS BOX */
-.vless-box{background:linear-gradient(135deg,var(--blue-900) 0%,#06335e 100%);border-radius:16px;padding:22px 24px;margin-bottom:22px;box-shadow:0 8px 30px rgba(4,44,83,0.18)}
-.vless-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:13px;flex-wrap:wrap;gap:10px}
-.vless-title{color:var(--blue-200);font-size:12px;display:flex;align-items:center;gap:7px;font-weight:600}
-.vless-title i{font-size:17px}
-.vless-link-wrap{background:rgba(255,255,255,0.04);border:1px solid rgba(55,138,221,0.22);border-radius:10px;padding:14px 16px}
-.vless-link{color:var(--blue-100);font-size:11.5px;font-family:ui-monospace,monospace;word-break:break-all;line-height:1.7;letter-spacing:.01em}
-.vless-actions{display:flex;gap:9px;margin-top:14px;flex-wrap:wrap}
-.btn{font-family:inherit;font-size:12.5px;font-weight:500;border-radius:9px;padding:9px 15px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;border:none;transition:.15s;white-space:nowrap}
-.btn-primary{background:var(--blue-600);color:#fff;box-shadow:0 2px 8px rgba(24,95,165,0.25)}
-.btn-primary:hover{background:var(--blue-700)}
-.btn-outline{background:transparent;border:1px solid rgba(55,138,221,0.35);color:var(--blue-200)}
-.btn-outline:hover{background:rgba(55,138,221,0.1)}
-.btn-light-outline{background:var(--white);border:1px solid var(--border);color:var(--blue-700)}
-.btn-light-outline:hover{background:var(--blue-50)}
-.btn-danger{background:var(--red-bg);color:var(--red-text);border:1px solid #f0a5a580}
-.btn-danger:hover{background:#f7c1c1}
-.btn-sm{padding:6px 11px;font-size:11.5px;border-radius:7px}
+.vless-box{
+  background:linear-gradient(135deg,#0a1e3d 0%,#061527 100%);
+  border:1px solid rgba(59,130,246,0.2);
+  border-radius:16px;padding:22px 24px;margin-bottom:20px;
+  box-shadow:0 8px 32px rgba(0,0,0,0.3),0 0 0 1px rgba(59,130,246,0.05);
+  position:relative;overflow:hidden;
+}
+.vless-box::before{
+  content:'';position:absolute;top:-60px;left:-60px;width:200px;height:200px;
+  background:radial-gradient(circle,rgba(59,130,246,0.08) 0%,transparent 70%);
+  pointer-events:none;
+}
+.vless-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
+.vless-title{color:var(--text-2);font-size:11.5px;display:flex;align-items:center;gap:7px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.vless-title i{font-size:16px;color:var(--accent)}
+.vless-link-wrap{
+  background:rgba(0,0,0,0.25);
+  border:1px solid rgba(59,130,246,0.15);
+  border-radius:10px;padding:14px 16px;
+}
+.vless-link{color:var(--accent-2);font-size:11px;font-family:ui-monospace,monospace;word-break:break-all;line-height:1.8;opacity:.9}
+.vless-actions{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}
+
+/* BUTTONS */
+.btn{
+  font-family:inherit;font-size:12.5px;font-weight:500;
+  border-radius:9px;padding:9px 15px;cursor:pointer;
+  display:inline-flex;align-items:center;gap:6px;border:none;
+  transition:all .15s;white-space:nowrap;
+}
 .btn i{font-size:14px}
-.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 2px 12px rgba(59,130,246,0.3)}
+.btn-primary:hover{background:#2563EB;box-shadow:0 4px 18px rgba(59,130,246,0.4)}
+.btn-outline{background:transparent;border:1px solid var(--card-border);color:var(--text-2)}
+.btn-outline:hover{background:var(--accent-dim);border-color:rgba(59,130,246,0.3)}
+.btn-ghost{background:var(--accent-dim);color:var(--accent-2);border:1px solid rgba(59,130,246,0.15)}
+.btn-ghost:hover{background:rgba(59,130,246,0.2)}
+.btn-danger{background:var(--red-bg);color:var(--red-text);border:1px solid rgba(239,68,68,0.2)}
+.btn-danger:hover{background:rgba(239,68,68,0.2)}
+.btn-success{background:var(--green-bg);color:var(--green-text);border:1px solid rgba(16,185,129,0.2)}
+.btn-sm{padding:6px 10px;font-size:11px;border-radius:7px;gap:4px}
+.btn-sm i{font-size:12px}
+
+/* CARDS */
+.card{background:var(--card);border:1px solid var(--card-border);border-radius:var(--radius);padding:20px 22px;transition:border-color .2s}
+.card:hover{border-color:var(--card-border-hover)}
+.card-title{font-size:13px;font-weight:700;color:var(--text-1);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.card-title i{font-size:17px;color:var(--accent)}
+.ml-auto{margin-right:auto}
 
 /* GRID */
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px}
-.grid3{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:22px}
-.card{background:var(--white);border-radius:14px;border:1px solid var(--border);padding:20px 22px;box-shadow:var(--shadow)}
-.card-title{font-size:13.5px;font-weight:700;color:var(--blue-800);margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.card-title i{font-size:18px;color:var(--blue-400)}
-.card-title .ml-auto{margin-right:auto}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
+.grid3{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:18px}
+.gap-18{margin-bottom:18px}
 
-/* STATUS TABLE */
-.status-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--blue-50);font-size:12.5px}
+/* STATUS ROWS */
+.status-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(59,130,246,0.06);font-size:12.5px}
 .status-row:last-child{border-bottom:none}
-.status-key{color:var(--blue-800);display:flex;align-items:center;gap:7px}
-.status-key i{font-size:15px;color:var(--blue-400)}
-.status-val{color:var(--blue-600);font-weight:600}
-.speed-bar{height:6px;border-radius:4px;background:var(--blue-50);margin-top:6px;overflow:hidden}
-.speed-fill{height:100%;border-radius:4px;background:linear-gradient(90deg,var(--blue-300),var(--blue-500));transition:width 1s}
+.status-key{color:var(--text-2);display:flex;align-items:center;gap:7px}
+.status-key i{font-size:14px;color:var(--text-3)}
+.status-val{color:var(--text-1);font-weight:600;font-size:12px}
 
-/* ERRORS */
-.err-row{padding:10px 0;border-bottom:1px solid var(--blue-50);font-size:11.5px}
-.err-row:last-child{border-bottom:none}
-.err-time{color:var(--blue-400);font-size:10px;margin-bottom:3px;display:flex;align-items:center;gap:5px}
-.err-msg{color:var(--red-text);font-family:ui-monospace,monospace;background:var(--red-bg);padding:7px 10px;border-radius:7px;word-break:break-all}
-
-/* CHARTS */
+/* CHART */
 .chart-wrap{position:relative;height:220px;width:100%}
-.chart-wrap-sm{position:relative;height:180px;width:100%}
-
-/* FOOTER */
-.dash-footer{border-top:1px solid var(--border);margin-top:14px;padding-top:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.footer-text{font-size:11px;color:var(--blue-400)}
-.footer-link{font-size:12.5px;color:var(--blue-600);text-decoration:none;display:flex;align-items:center;gap:6px;font-weight:500}
-.footer-link:hover{color:var(--blue-800)}
-
-/* TOAST */
-.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(40px);background:var(--blue-900);color:#fff;border-radius:10px;padding:11px 22px;font-size:13px;opacity:0;transition:all .3s;z-index:999;pointer-events:none;display:flex;align-items:center;gap:8px;box-shadow:0 6px 24px rgba(0,0,0,.2)}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.toast.err{background:var(--red-text)}
-
-/* FORM ELEMENTS */
-.form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
-.form-group{display:flex;flex-direction:column;gap:6px}
-.form-label{font-size:11.5px;color:var(--blue-700);font-weight:600}
-.form-input,.form-select{padding:10px 13px;border-radius:9px;border:1px solid var(--border);font-family:inherit;font-size:12.5px;outline:none;color:var(--text-1);background:var(--bg);min-width:120px;transition:.15s}
-.form-input:focus,.form-select:focus{border-color:var(--blue-400);background:#fff}
+.chart-wrap-lg{position:relative;height:320px;width:100%}
+.chart-wrap-sm{position:relative;height:170px;width:100%}
 
 /* LINKS TABLE */
 .links-table{width:100%;border-collapse:collapse}
-.links-table th{text-align:right;font-size:11px;color:var(--blue-400);font-weight:600;padding:10px 8px;border-bottom:2px solid var(--blue-50);white-space:nowrap}
-.links-table td{padding:13px 8px;border-bottom:1px solid var(--blue-50);font-size:12.5px;vertical-align:middle}
+.links-table th{text-align:right;font-size:10px;color:var(--text-3);font-weight:600;padding:10px 10px;border-bottom:1px solid var(--card-border);text-transform:uppercase;letter-spacing:.06em;white-space:nowrap}
+.links-table td{padding:12px 10px;border-bottom:1px solid rgba(59,130,246,0.05);font-size:12.5px;vertical-align:middle}
 .links-table tr:last-child td{border-bottom:none}
-.links-table tr:hover td{background:var(--blue-50)}
-.link-uuid{font-family:ui-monospace,monospace;font-size:10.5px;color:var(--blue-600);background:var(--blue-50);padding:3px 8px;border-radius:6px;display:inline-block}
-.usage-bar-wrap{width:140px}
-.usage-bar{height:7px;border-radius:4px;background:var(--blue-50);overflow:hidden;margin-bottom:4px}
+.links-table tbody tr{transition:.15s}
+.links-table tbody tr:hover td{background:rgba(59,130,246,0.03)}
+.link-uuid{font-family:ui-monospace,monospace;font-size:10px;color:var(--accent-2);background:var(--accent-dim);padding:3px 7px;border-radius:6px;display:inline-block;letter-spacing:.03em}
+.usage-bar{height:6px;border-radius:4px;background:rgba(59,130,246,0.1);overflow:hidden;margin-bottom:4px}
 .usage-bar-fill{height:100%;border-radius:4px;transition:width .3s}
-.usage-text{font-size:10.5px;color:var(--blue-400)}
-.empty-state{text-align:center;padding:50px 20px;color:var(--blue-400)}
-.empty-state i{font-size:42px;color:var(--blue-200);margin-bottom:12px;display:block}
+.usage-text{font-size:10px;color:var(--text-3)}
+.link-label{font-weight:600;color:var(--text-1)}
+.link-meta{font-size:10px;color:var(--text-3);margin-top:2px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.expiry-badge{font-size:9.5px;padding:2px 7px;border-radius:5px;font-weight:600;display:inline-flex;align-items:center;gap:3px}
+.expiry-ok{background:rgba(16,185,129,0.1);color:var(--green-text)}
+.expiry-warn{background:var(--amber-bg);color:var(--amber-text)}
+.expiry-exp{background:var(--red-bg);color:var(--red-text)}
+.expiry-none{background:var(--accent-dim);color:var(--accent-2)}
 
 /* TOGGLE */
-.toggle{width:38px;height:21px;border-radius:20px;background:var(--blue-100);position:relative;cursor:pointer;transition:.2s;flex-shrink:0;border:none}
-.toggle::after{content:'';position:absolute;width:15px;height:15px;border-radius:50%;background:#fff;top:3px;right:3px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
-.toggle.on{background:var(--green-dot)}
-.toggle.on::after{right:20px}
+.toggle{width:36px;height:20px;border-radius:20px;background:rgba(59,130,246,0.15);position:relative;cursor:pointer;transition:.2s;flex-shrink:0;border:1px solid var(--card-border)}
+.toggle::after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;background:var(--text-3);top:2px;right:2px;transition:.2s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.toggle.on{background:var(--green);border-color:var(--green)}
+.toggle.on::after{right:18px;background:#fff}
 
-/* INFO CALLOUT */
-.callout{background:var(--blue-50);border:1px solid var(--blue-100);border-radius:11px;padding:14px 16px;font-size:12px;color:var(--blue-700);display:flex;gap:10px;align-items:flex-start;line-height:1.8}
-.callout i{font-size:18px;color:var(--blue-400);margin-top:1px}
-.callout.amber{background:var(--amber-bg);border-color:#f0d9ab;color:var(--amber-text)}
-.callout.amber i{color:var(--amber-dot)}
+/* FORM */
+.form-row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.form-group{display:flex;flex-direction:column;gap:6px}
+.form-label{font-size:10.5px;color:var(--text-3);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.form-input,.form-select{
+  padding:10px 13px;border-radius:9px;
+  border:1px solid var(--card-border);
+  background:rgba(0,0,0,0.25);
+  color:var(--text-1);font-family:inherit;font-size:12.5px;outline:none;
+  transition:all .15s;min-width:110px;
+}
+.form-input::placeholder{color:var(--text-3)}
+.form-input:focus,.form-select:focus{border-color:rgba(59,130,246,0.4);background:rgba(0,0,0,0.35);box-shadow:0 0 0 3px rgba(59,130,246,0.08)}
+.form-select option{background:var(--bg2)}
+
+/* CALLOUT */
+.callout{
+  background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);
+  border-radius:11px;padding:13px 15px;font-size:11.5px;color:var(--text-2);
+  display:flex;gap:10px;align-items:flex-start;line-height:1.8;margin-top:14px;
+}
+.callout i{font-size:16px;color:var(--accent);margin-top:1px;flex-shrink:0}
+.callout.amber{background:var(--amber-bg);border-color:rgba(245,158,11,0.2);color:var(--amber-text)}
+.callout.amber i{color:var(--amber)}
+.callout.red{background:var(--red-bg);border-color:rgba(239,68,68,0.2);color:var(--red-text)}
+.callout.red i{color:var(--red)}
+
+/* SUB BOX */
+.sub-box{
+  background:linear-gradient(135deg,rgba(139,92,246,0.08) 0%,rgba(59,130,246,0.05) 100%);
+  border:1px solid rgba(139,92,246,0.2);
+  border-radius:12px;padding:16px 18px;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;
+  margin-top:12px;
+}
+.sub-url{font-family:ui-monospace,monospace;font-size:11px;color:#A78BFA;word-break:break-all;flex:1}
+.sub-actions{display:flex;gap:7px;flex-shrink:0}
+
+/* ERRORS */
+.err-row{padding:10px 0;border-bottom:1px solid rgba(59,130,246,0.06)}
+.err-row:last-child{border-bottom:none}
+.err-time{color:var(--text-3);font-size:10px;margin-bottom:3px;display:flex;align-items:center;gap:5px}
+.err-msg{color:var(--red-text);font-family:ui-monospace,monospace;background:var(--red-bg);padding:7px 10px;border-radius:7px;word-break:break-all;font-size:11px}
+
+/* BWBAR */
+.speed-bar{height:5px;border-radius:3px;background:rgba(59,130,246,0.1);overflow:hidden;margin-top:5px}
+.speed-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width 1s}
+
+/* EMPTY STATE */
+.empty-state{text-align:center;padding:50px 20px;color:var(--text-3)}
+.empty-state i{font-size:40px;color:var(--text-3);margin-bottom:12px;display:block;opacity:.5}
+.empty-state p{font-size:12.5px;margin-top:6px}
 
 /* IDEA CARDS */
 .idea-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.idea-card{background:var(--white);border:1px solid var(--border);border-radius:14px;padding:18px;box-shadow:var(--shadow)}
-.idea-icon{width:38px;height:38px;border-radius:10px;background:var(--blue-50);display:flex;align-items:center;justify-content:center;color:var(--blue-500);font-size:19px;margin-bottom:11px}
-.idea-title{font-size:13px;font-weight:700;color:var(--blue-900);margin-bottom:6px}
-.idea-desc{font-size:11.5px;color:var(--blue-600);line-height:1.8}
-.idea-badge{display:inline-block;margin-top:10px;font-size:10px;background:var(--blue-50);color:var(--blue-500);padding:3px 9px;border-radius:20px;font-weight:600}
+.idea-card{background:var(--card);border:1px solid var(--card-border);border-radius:14px;padding:18px;transition:.2s}
+.idea-card:hover{border-color:var(--card-border-hover);transform:translateY(-2px)}
+.idea-icon{width:38px;height:38px;border-radius:10px;background:var(--accent-dim);display:flex;align-items:center;justify-content:center;color:var(--accent);font-size:19px;margin-bottom:12px}
+.idea-title{font-size:13px;font-weight:700;color:var(--text-1);margin-bottom:6px}
+.idea-desc{font-size:11px;color:var(--text-3);line-height:1.8}
+.idea-badge{display:inline-block;margin-top:10px;font-size:9.5px;padding:2px 9px;border-radius:20px;font-weight:600}
+.idea-badge.done{background:var(--green-bg);color:var(--green-text)}
+.idea-badge.suggest{background:var(--accent-dim);color:var(--accent-2)}
 
-@media(max-width:1000px){
+/* TOAST */
+.toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(40px);
+  background:var(--card);border:1px solid var(--card-border);
+  color:var(--text-1);border-radius:11px;padding:11px 20px;font-size:13px;
+  opacity:0;transition:all .25s;z-index:999;pointer-events:none;
+  display:flex;align-items:center;gap:9px;box-shadow:0 8px 30px rgba(0,0,0,.4);
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.toast.err{border-color:rgba(239,68,68,0.3);background:rgba(239,68,68,0.1);color:var(--red-text)}
+.toast.ok{border-color:rgba(16,185,129,0.3);background:rgba(16,185,129,0.1);color:var(--green-text)}
+
+/* FOOTER */
+.dash-footer{border-top:1px solid var(--card-border);margin-top:16px;padding-top:16px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+.footer-text{font-size:10.5px;color:var(--text-3)}
+.footer-link{font-size:12px;color:var(--accent-2);display:flex;align-items:center;gap:5px;font-weight:500}
+.footer-link:hover{color:var(--text-1)}
+
+/* CONN ITEM */
+.conn-item{padding:12px 14px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.12);border-radius:10px;margin-bottom:8px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.conn-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);flex-shrink:0}
+
+@media(max-width:1050px){
   .sidebar{transform:translateX(100%)}
-  .sidebar.open{transform:translateX(0);box-shadow:-8px 0 30px rgba(4,44,83,0.3)}
+  .sidebar.open{transform:translateX(0);box-shadow:-10px 0 40px rgba(0,0,0,.5)}
   .sidebar-close{display:flex}
-  .main{margin-right:0;max-width:100%;padding-top:72px}
+  .main{margin-right:0;padding-top:72px}
   .mobile-topbar{display:flex}
   .metrics{grid-template-columns:1fr 1fr}
   .grid2,.grid3{grid-template-columns:1fr}
-  .idea-grid{grid-template-columns:1fr}
+  .idea-grid{grid-template-columns:1fr 1fr}
 }
-@media(max-width:480px){
+@media(max-width:520px){
   .metrics{grid-template-columns:1fr}
-  .main{padding-left:14px;padding-right:14px}
+  .main{padding:64px 14px 50px}
+  .idea-grid{grid-template-columns:1fr}
+  .links-table th:nth-child(2),.links-table td:nth-child(2){display:none}
 }
 </style>
 </head>
@@ -935,88 +1312,87 @@ a{color:inherit}
 
 <div class="toast" id="toast"></div>
 
-<!-- MOBILE TOPBAR -->
 <div class="mobile-topbar">
   <div class="mt-left">
-    <img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox">
+    <div class="mt-logo"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox"></div>
     <span class="mt-title">RVG Gateway</span>
   </div>
   <button class="menu-btn" id="open-sidebar-btn"><i class="ti ti-menu-2"></i></button>
 </div>
 
-<!-- OVERLAY -->
 <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
-<!-- SIDEBAR -->
 <aside class="sidebar" id="sidebar">
   <button class="sidebar-close" id="close-sidebar-btn"><i class="ti ti-x"></i></button>
   <div class="logo">
-    <img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox">
+    <div class="logo-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox"></div>
     <div>
       <div class="logo-name">codebox</div>
-      <div class="logo-sub">RVG Gateway · v6.0</div>
+      <div class="logo-sub">RVG Gateway · v7.0</div>
     </div>
   </div>
 
   <div class="nav-scroll">
-    <div class="nav-group-label">پنل</div>
-    <div class="nav-item active" data-page="overview"><i class="ti ti-layout-dashboard"></i> داشبورد کلی</div>
+    <div class="nav-section">پنل</div>
+    <div class="nav-item active" data-page="overview"><i class="ti ti-layout-dashboard"></i> داشبورد</div>
     <div class="nav-item" data-page="links"><i class="ti ti-link-plus"></i> مدیریت لینک‌ها <span class="nav-badge" id="links-count-badge">0</span></div>
+    <div class="nav-item" data-page="subscriptions"><i class="ti ti-rss"></i> سابسکریپشن</div>
     <div class="nav-item" data-page="traffic"><i class="ti ti-chart-area"></i> آمار ترافیک</div>
-    <div class="nav-item" data-page="connections"><i class="ti ti-plug-connected"></i> اتصالات فعال <span class="nav-badge" id="conns-count-badge">0</span></div>
-
-    <div class="nav-group-label">سیستم</div>
+    <div class="nav-item" data-page="connections"><i class="ti ti-plug-connected"></i> اتصالات <span class="nav-badge" id="conns-count-badge">0</span></div>
+    <div class="nav-section">سیستم</div>
     <div class="nav-item" data-page="security"><i class="ti ti-shield-lock"></i> امنیت</div>
     <div class="nav-item" data-page="errors"><i class="ti ti-alert-triangle"></i> خطاها</div>
-    <div class="nav-item" data-page="ideas"><i class="ti ti-bulb"></i> ایده‌ها و قابلیت‌ها</div>
+    <div class="nav-item" data-page="ideas"><i class="ti ti-bulb"></i> ایده‌ها</div>
     <div class="nav-item" data-page="testws"><i class="ti ti-wifi"></i> تست WebSocket</div>
     <div class="nav-item" data-page="settings"><i class="ti ti-settings"></i> تنظیمات</div>
   </div>
 
   <div class="sidebar-footer">
-    <div class="sidebar-footer-label"><i class="ti ti-brand-telegram"></i> کانال تلگرام codebox</div>
-    <a class="tg-btn" href="https://t.me/CodeBoxo" target="_blank" rel="noopener">
+    <a class="tg-link" href="https://t.me/CodeBoxo" target="_blank" rel="noopener">
       <i class="ti ti-brand-telegram"></i> @CodeBoxo
     </a>
     <button class="logout-btn" id="logout-btn"><i class="ti ti-logout"></i> خروج از حساب</button>
   </div>
 </aside>
 
-<!-- MAIN -->
 <main class="main">
 
-  <!-- ═══════ OVERVIEW PAGE ═══════ -->
+  <!-- ═══ OVERVIEW ═══ -->
   <section class="page active" id="page-overview">
     <div class="topbar">
       <div>
-        <div class="topbar-title"><i class="ti ti-layout-dashboard"></i> داشبورد کلی</div>
+        <div class="topbar-title"><i class="ti ti-layout-dashboard"></i> داشبورد</div>
         <div class="topbar-sub" id="last-update">در حال بارگذاری...</div>
       </div>
       <div class="topbar-right">
         <span class="badge badge-green"><span class="dot dot-green pulse"></span> سرور فعال</span>
-        <span class="badge badge-blue" id="uptime-badge">Railway · --</span>
-        <button class="btn btn-primary" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
+        <span class="badge badge-blue" id="uptime-badge">—</span>
+        <button class="btn btn-primary btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
       </div>
     </div>
 
     <div class="metrics">
       <div class="metric">
-        <div class="metric-label"><i class="ti ti-plug-connected"></i> اتصالات فعال</div>
+        <div class="metric-icon"><i class="ti ti-plug-connected"></i></div>
+        <div class="metric-label">اتصالات فعال</div>
         <div class="metric-val" id="m-conns">—</div>
-        <div class="metric-sub" id="m-conns-sub">اتصال WebSocket باز</div>
+        <div class="metric-sub"><span class="dot dot-green" style="animation:pulse 2s infinite"></span> WebSocket زنده</div>
       </div>
       <div class="metric">
-        <div class="metric-label"><i class="ti ti-transfer"></i> کل ترافیک</div>
+        <div class="metric-icon"><i class="ti ti-transfer"></i></div>
+        <div class="metric-label">کل ترافیک</div>
         <div class="metric-val" id="m-traffic">—<span class="metric-unit">MB</span></div>
-        <div class="metric-sub">از ابتدای راه‌اندازی</div>
+        <div class="metric-sub">از راه‌اندازی سرویس</div>
       </div>
-      <div class="metric">
-        <div class="metric-label"><i class="ti ti-send"></i> کل درخواست‌ها</div>
-        <div class="metric-val" id="m-reqs">—</div>
-        <div class="metric-sub">از ابتدای سرویس</div>
+      <div class="metric success">
+        <div class="metric-icon"><i class="ti ti-link"></i></div>
+        <div class="metric-label">لینک‌های فعال</div>
+        <div class="metric-val" id="m-active-links">—</div>
+        <div class="metric-sub" id="m-links-sub">از کل لینک‌ها</div>
       </div>
-      <div class="metric metric-error">
-        <div class="metric-label"><i class="ti ti-alert-circle"></i> خطاها</div>
+      <div class="metric danger">
+        <div class="metric-icon"><i class="ti ti-alert-circle"></i></div>
+        <div class="metric-label">خطاها</div>
         <div class="metric-val" id="m-errors">—</div>
         <div class="metric-sub">ثبت شده</div>
       </div>
@@ -1025,79 +1401,78 @@ a{color:inherit}
     <div class="vless-box">
       <div class="vless-header">
         <div class="vless-title"><i class="ti ti-link"></i> لینک پیش‌فرض (بدون محدودیت)</div>
-        <span class="badge" style="background:rgba(55,138,221,0.15);color:var(--blue-200)">TLS 443 · WS</span>
+        <span class="badge badge-blue"><span class="dot dot-blue" style="margin-left:4px"></span>TLS 443 · WS</span>
       </div>
       <div class="vless-link-wrap">
         <div class="vless-link" id="vless-link-overview">در حال دریافت...</div>
       </div>
       <div class="vless-actions">
         <button class="btn btn-primary" onclick="copyText('vless-link-overview')"><i class="ti ti-copy"></i> کپی لینک</button>
-        <button class="btn btn-outline" onclick="qrFor('vless-link-overview')"><i class="ti ti-qrcode"></i> QR کد</button>
-        <button class="btn btn-outline" onclick="switchPage('links')"><i class="ti ti-link-plus"></i> ساخت لینک با محدودیت ترافیک</button>
-        <a class="btn btn-outline" href="https://t.me/CodeBoxo" target="_blank" rel="noopener" style="text-decoration:none">
-          <i class="ti ti-brand-telegram"></i> codebox
-        </a>
+        <button class="btn btn-ghost" onclick="qrFor('vless-link-overview')"><i class="ti ti-qrcode"></i> QR کد</button>
+        <button class="btn btn-outline" onclick="switchPage('links')"><i class="ti ti-link-plus"></i> ساخت لینک محدود</button>
+        <button class="btn btn-outline" onclick="switchPage('subscriptions')"><i class="ti ti-rss"></i> سابسکریپشن</button>
       </div>
     </div>
 
     <div class="grid3">
       <div class="card">
         <div class="card-title"><i class="ti ti-chart-area"></i> ترافیک ساعتی (MB)</div>
-        <div class="chart-wrap"><canvas id="trafficChart" role="img" aria-label="نمودار ترافیک ساعتی"></canvas></div>
+        <div class="chart-wrap"><canvas id="trafficChart"></canvas></div>
       </div>
       <div class="card">
-        <div class="card-title"><i class="ti ti-chart-donut"></i> توزیع درخواست‌ها</div>
-        <div class="chart-wrap-sm"><canvas id="donutChart" role="img" aria-label="توزیع نوع ترافیک"></canvas></div>
+        <div class="card-title"><i class="ti ti-chart-donut"></i> توزیع ترافیک</div>
+        <div class="chart-wrap-sm"><canvas id="donutChart"></canvas></div>
       </div>
     </div>
 
     <div class="grid2">
       <div class="card">
         <div class="card-title"><i class="ti ti-activity"></i> وضعیت سرویس‌ها</div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-circle-check"></i> VLESS / WebSocket Tunnel</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-circle-check"></i> VLESS / WebSocket</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
         <div class="status-row"><span class="status-key"><i class="ti ti-circle-check"></i> HTTP Proxy</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-server"></i> Async Connection Pool</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-rss"></i> Subscription API</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
         <div class="status-row"><span class="status-key"><i class="ti ti-clock"></i> آپتایم</span><span class="status-val" id="uptime-inline">—</span></div>
-        <div class="status-row" style="flex-direction:column;align-items:flex-start;gap:6px">
-          <div style="width:100%;display:flex;justify-content:space-between"><span class="status-key"><i class="ti ti-gauge"></i> پهنای باند (نسبی)</span><span class="status-val" id="bw-pct">—%</span></div>
+        <div class="status-row" style="flex-direction:column;align-items:flex-start;gap:5px">
+          <div style="width:100%;display:flex;justify-content:space-between">
+            <span class="status-key"><i class="ti ti-gauge"></i> بار نسبی</span>
+            <span class="status-val" id="bw-pct">—%</span>
+          </div>
           <div class="speed-bar" style="width:100%"><div class="speed-fill" id="bw-bar" style="width:0%"></div></div>
         </div>
       </div>
       <div class="card">
-        <div class="card-title"><i class="ti ti-link-plus"></i> خلاصه لینک‌ها <span class="ml-auto badge badge-blue" id="links-summary-badge">۰ لینک</span></div>
-        <div id="links-summary-list" style="font-size:12px;color:var(--blue-400)">در حال بارگذاری...</div>
+        <div class="card-title"><i class="ti ti-list"></i> خلاصه لینک‌ها <span class="ml-auto badge badge-blue" id="links-summary-badge">۰</span></div>
+        <div id="links-summary-list"><div class="empty-state"><i class="ti ti-link-off"></i><p>هنوز لینکی وجود ندارد</p></div></div>
       </div>
     </div>
 
     <div class="dash-footer">
-      <span class="footer-text">codebox RVG Gateway v6.0 · Railway · 2025</span>
-      <a class="footer-link" href="https://t.me/CodeBoxo" target="_blank" rel="noopener">
-        <i class="ti ti-brand-telegram" style="font-size:16px"></i> t.me/CodeBoxo
-      </a>
+      <span class="footer-text">codebox RVG Gateway v7.0 · Railway · 2025</span>
+      <a class="footer-link" href="https://t.me/CodeBoxo" target="_blank" rel="noopener"><i class="ti ti-brand-telegram"></i> t.me/CodeBoxo</a>
     </div>
   </section>
 
-  <!-- ═══════ LINKS MANAGEMENT PAGE ═══════ -->
+  <!-- ═══ LINKS ═══ -->
   <section class="page" id="page-links">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-link-plus"></i> مدیریت لینک‌ها</div>
-        <div class="topbar-sub">ساخت لینک رندوم با محدودیت ترافیک اختصاصی (MB / GB)</div>
+        <div class="topbar-sub">ساخت لینک رندوم با محدودیت ترافیک و تاریخ انقضا</div>
       </div>
       <div class="topbar-right">
-        <span class="badge badge-blue" id="links-page-count">۰ لینک ساخته شده</span>
+        <span class="badge badge-blue" id="links-page-count">۰ لینک</span>
       </div>
     </div>
 
-    <div class="card" style="margin-bottom:18px">
+    <div class="card gap-18">
       <div class="card-title"><i class="ti ti-plus"></i> ساخت لینک جدید</div>
       <div class="form-row">
-        <div class="form-group" style="flex:1;min-width:180px">
-          <label class="form-label">عنوان / یادداشت لینک</label>
-          <input class="form-input" id="new-link-label" placeholder="مثلاً: برای علی" style="width:100%">
+        <div class="form-group" style="flex:1;min-width:160px">
+          <label class="form-label">عنوان لینک</label>
+          <input class="form-input" id="new-link-label" placeholder="مثلاً: کاربر علی" style="width:100%">
         </div>
         <div class="form-group">
-          <label class="form-label">مقدار سهمیه ترافیک</label>
+          <label class="form-label">سهمیه ترافیک</label>
           <input class="form-input" id="new-link-value" type="number" min="0" step="0.1" placeholder="0 = بی‌نهایت" style="width:130px">
         </div>
         <div class="form-group">
@@ -1107,273 +1482,336 @@ a{color:inherit}
             <option value="MB" selected>مگابایت (MB)</option>
           </select>
         </div>
-        <button class="btn btn-primary" onclick="createLink()"><i class="ti ti-link-plus"></i> ساخت لینک رندوم</button>
+        <div class="form-group">
+          <label class="form-label">انقضا (روز)</label>
+          <input class="form-input" id="new-link-expires" type="number" min="0" step="1" placeholder="0 = بی‌نهایت" style="width:110px">
+        </div>
+        <div class="form-group" style="flex:1;min-width:140px">
+          <label class="form-label">یادداشت (اختیاری)</label>
+          <input class="form-input" id="new-link-note" placeholder="توضیح برای خودتان" style="width:100%">
+        </div>
+        <button class="btn btn-primary" onclick="createLink()"><i class="ti ti-link-plus"></i> ساخت لینک</button>
       </div>
-      <div class="callout" style="margin-top:14px">
+      <div class="callout">
         <i class="ti ti-info-circle"></i>
-        <span>هر لینک یک UUID کاملاً رندوم و یکتا دارد. اگر مقدار سهمیه را ۰ یا خالی بگذارید، لینک بدون محدودیت ترافیک خواهد بود. به محض رسیدن مصرف به سقف تعیین‌شده، اتصال آن لینک به‌صورت خودکار قطع و مسدود می‌شود.</span>
+        <span>هر لینک دارای UUID رندوم و یکتا است. سهمیه یا انقضای ۰ یعنی بی‌نهایت. پس از اتمام سهمیه یا تاریخ انقضا، اتصال لینک به‌صورت خودکار مسدود می‌شود.</span>
       </div>
     </div>
 
     <div class="card">
       <div class="card-title"><i class="ti ti-list"></i> لینک‌های ساخته‌شده</div>
       <div style="overflow-x:auto">
-      <table class="links-table">
-        <thead>
-          <tr>
-            <th>عنوان</th>
-            <th>UUID</th>
-            <th>مصرف / سهمیه</th>
-            <th>وضعیت</th>
-            <th>عملیات</th>
-          </tr>
-        </thead>
-        <tbody id="links-tbody"></tbody>
-      </table>
+        <table class="links-table">
+          <thead>
+            <tr>
+              <th>عنوان / یادداشت</th>
+              <th>UUID</th>
+              <th>مصرف / سهمیه</th>
+              <th>انقضا</th>
+              <th>وضعیت</th>
+              <th>عملیات</th>
+            </tr>
+          </thead>
+          <tbody id="links-tbody"></tbody>
+        </table>
       </div>
       <div class="empty-state" id="links-empty" style="display:none">
         <i class="ti ti-link-off"></i>
-        هنوز هیچ لینکی ساخته نشده. از فرم بالا یک لینک جدید بسازید.
+        <p>هنوز هیچ لینکی ساخته نشده. از فرم بالا لینک جدید بسازید.</p>
       </div>
     </div>
   </section>
 
-  <!-- ═══════ TRAFFIC PAGE ═══════ -->
+  <!-- ═══ SUBSCRIPTIONS ═══ -->
+  <section class="page" id="page-subscriptions">
+    <div class="topbar">
+      <div>
+        <div class="topbar-title"><i class="ti ti-rss"></i> سابسکریپشن</div>
+        <div class="topbar-sub">مدیریت و اشتراک‌گذاری لینک‌های سابسکریپشن</div>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card">
+        <div class="card-title"><i class="ti ti-rss"></i> سابسکریپشن تکی (هر لینک)</div>
+        <p style="font-size:12px;color:var(--text-3);margin-bottom:14px;line-height:1.8">
+          هر لینک یک آدرس سابسکریپشن اختصاصی دارد. کاربر می‌تواند این آدرس را در اپلیکیشن v2ray، هیدیفای، استریسند و غیره اضافه کند تا کانفیگ به‌صورت خودکار آپدیت شود.
+        </p>
+        <div class="callout">
+          <i class="ti ti-info-circle"></i>
+          <span>آدرس سابسکریپشن برای هر لینک در جدول <b>مدیریت لینک‌ها</b> موجود است. روی آیکون <i class="ti ti-rss"></i> کنار هر لینک کلیک کنید.</span>
+        </div>
+        <div style="margin-top:14px">
+          <div class="status-row"><span class="status-key"><i class="ti ti-world"></i> فرمت</span><span class="status-val">Base64 / VLESS</span></div>
+          <div class="status-row"><span class="status-key"><i class="ti ti-shield"></i> احراز هویت</span><span class="status-val">UUID در مسیر URL</span></div>
+          <div class="status-row"><span class="status-key"><i class="ti ti-refresh"></i> آپدیت خودکار</span><span class="status-val">پشتیبانی اپ‌های معیار</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title"><i class="ti ti-database"></i> سابسکریپشن کامل (همه لینک‌های فعال)</div>
+        <p style="font-size:12px;color:var(--text-3);margin-bottom:14px;line-height:1.8">
+          این آدرس شامل تمام لینک‌های فعال و منقضی‌نشده است. مخصوص استفاده شخصی یا مدیریتی — فقط برای کسانی که به پنل دسترسی دارند.
+        </p>
+        <div class="sub-box" id="sub-all-box">
+          <span class="sub-url" id="sub-all-url">در حال دریافت...</span>
+          <div class="sub-actions">
+            <button class="btn btn-sm btn-ghost" onclick="copySubAll()"><i class="ti ti-copy"></i></button>
+            <button class="btn btn-sm btn-ghost" onclick="openSubAll()"><i class="ti ti-external-link"></i></button>
+          </div>
+        </div>
+        <div class="callout amber" style="margin-top:14px">
+          <i class="ti ti-alert-triangle"></i>
+          <span>این آدرس نیاز به احراز هویت دارد (سشن کوکی). فقط در مرورگر لاگین‌شده کار می‌کند.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><i class="ti ti-list"></i> لینک‌های فعال با آدرس سابسکریپشن</div>
+      <div id="sub-links-list" style="font-size:12px;color:var(--text-3)">در حال بارگذاری...</div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <div class="card-title"><i class="ti ti-device-mobile"></i> اپلیکیشن‌های سازگار</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-top:4px">
+        <div style="padding:12px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);border-radius:10px;font-size:11.5px;color:var(--text-2);display:flex;align-items:center;gap:8px"><i class="ti ti-brand-android" style="color:var(--accent)"></i> Hiddify (Android)</div>
+        <div style="padding:12px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);border-radius:10px;font-size:11.5px;color:var(--text-2);display:flex;align-items:center;gap:8px"><i class="ti ti-brand-apple" style="color:var(--accent)"></i> Shadowrocket (iOS)</div>
+        <div style="padding:12px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);border-radius:10px;font-size:11.5px;color:var(--text-2);display:flex;align-items:center;gap:8px"><i class="ti ti-device-desktop" style="color:var(--accent)"></i> v2rayN (Windows)</div>
+        <div style="padding:12px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);border-radius:10px;font-size:11.5px;color:var(--text-2);display:flex;align-items:center;gap:8px"><i class="ti ti-apple" style="color:var(--accent)"></i> v2rayU (macOS)</div>
+        <div style="padding:12px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);border-radius:10px;font-size:11.5px;color:var(--text-2);display:flex;align-items:center;gap:8px"><i class="ti ti-device-mobile" style="color:var(--accent)"></i> NekoBox</div>
+        <div style="padding:12px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.15);border-radius:10px;font-size:11.5px;color:var(--text-2);display:flex;align-items:center;gap:8px"><i class="ti ti-brand-android" style="color:var(--accent)"></i> V2RayNG</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══ TRAFFIC ═══ -->
   <section class="page" id="page-traffic">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-chart-area"></i> آمار ترافیک</div>
-        <div class="topbar-sub">نمایش لحظه‌ای ترافیک عبوری از Gateway</div>
+        <div class="topbar-sub">نمایش لحظه‌ای ترافیک Gateway</div>
       </div>
       <div class="topbar-right">
-        <button class="btn btn-primary" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
+        <button class="btn btn-primary btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
       </div>
     </div>
-
     <div class="metrics" style="grid-template-columns:repeat(3,1fr)">
       <div class="metric">
-        <div class="metric-label"><i class="ti ti-database"></i> کل ترافیک</div>
+        <div class="metric-icon"><i class="ti ti-database"></i></div>
+        <div class="metric-label">کل ترافیک</div>
         <div class="metric-val" id="t-traffic">—<span class="metric-unit">MB</span></div>
-        <div class="metric-sub">جمع آپلود + دانلود</div>
+        <div class="metric-sub">آپلود + دانلود</div>
       </div>
       <div class="metric">
-        <div class="metric-label"><i class="ti ti-arrow-up"></i> میانگین در ساعت</div>
+        <div class="metric-icon"><i class="ti ti-arrow-up"></i></div>
+        <div class="metric-label">میانگین ساعتی</div>
         <div class="metric-val" id="t-avg">—<span class="metric-unit">MB</span></div>
         <div class="metric-sub">بر اساس داده‌های امروز</div>
       </div>
       <div class="metric">
-        <div class="metric-label"><i class="ti ti-chart-bar"></i> پیک ساعتی</div>
+        <div class="metric-icon"><i class="ti ti-chart-bar"></i></div>
+        <div class="metric-label">پیک ساعتی</div>
         <div class="metric-val" id="t-peak">—<span class="metric-unit">MB</span></div>
-        <div class="metric-sub">بالاترین مصرف ساعتی</div>
+        <div class="metric-sub">بالاترین مصرف</div>
       </div>
     </div>
-
     <div class="card">
-      <div class="card-title"><i class="ti ti-chart-area"></i> نمودار کامل ترافیک ساعتی</div>
-      <div class="chart-wrap" style="height:320px"><canvas id="trafficChartBig"></canvas></div>
+      <div class="card-title"><i class="ti ti-chart-area"></i> نمودار ترافیک ساعتی</div>
+      <div class="chart-wrap-lg"><canvas id="trafficChartBig"></canvas></div>
     </div>
   </section>
 
-  <!-- ═══════ CONNECTIONS PAGE ═══════ -->
+  <!-- ═══ CONNECTIONS ═══ -->
   <section class="page" id="page-connections">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-plug-connected"></i> اتصالات فعال</div>
-        <div class="topbar-sub">لیست اتصالات WebSocket باز در همین لحظه</div>
+        <div class="topbar-sub">WebSocket‌های باز در همین لحظه</div>
       </div>
       <div class="topbar-right">
-        <span class="badge badge-green" id="conns-live-badge"><span class="dot dot-green pulse"></span> ۰ اتصال زنده</span>
-        <button class="btn btn-primary" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
+        <span class="badge badge-green" id="conns-live-badge"><span class="dot dot-green pulse"></span> ۰ اتصال</span>
+        <button class="btn btn-primary btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
       </div>
     </div>
-
     <div class="card">
-      <div class="card-title"><i class="ti ti-list"></i> جزئیات اتصالات</div>
-      <div style="overflow-x:auto">
-      <table class="links-table">
-        <thead><tr><th>شناسه اتصال</th><th>UUID لینک</th><th>زمان اتصال</th><th>حجم انتقال</th></tr></thead>
-        <tbody id="conns-tbody"></tbody>
-      </table>
-      </div>
+      <div class="card-title"><i class="ti ti-list"></i> جزئیات</div>
+      <div id="conns-list"></div>
       <div class="empty-state" id="conns-empty" style="display:none">
         <i class="ti ti-plug-off"></i>
-        در حال حاضر هیچ اتصال فعالی وجود ندارد.
+        <p>هیچ اتصال فعالی وجود ندارد</p>
       </div>
     </div>
   </section>
 
-  <!-- ═══════ SECURITY PAGE ═══════ -->
+  <!-- ═══ SECURITY ═══ -->
   <section class="page" id="page-security">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-shield-lock"></i> امنیت</div>
-        <div class="topbar-sub">وضعیت امنیتی Gateway</div>
+        <div class="topbar-sub">وضعیت امنیتی و دسترسی‌های Gateway</div>
       </div>
     </div>
-
     <div class="grid2">
       <div class="card">
-        <div class="card-title"><i class="ti ti-lock"></i> رمزنگاری و انتقال</div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-certificate"></i> TLS / HTTPS</span><span class="status-val" style="color:var(--green-text)">● فعال (پورت 443)</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-fingerprint"></i> Fingerprint Spoofing</span><span class="status-val" style="color:var(--green-text)">Chrome</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-network"></i> نوع پروتکل</span><span class="status-val">VLESS over WebSocket</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-key"></i> کلید سرویس</span><span class="status-val">رمزنگاری شده (SHA-256)</span></div>
+        <div class="card-title"><i class="ti ti-lock"></i> رمزنگاری</div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-certificate"></i> TLS / HTTPS</span><span class="status-val" style="color:var(--green-text)">● فعال (443)</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-fingerprint"></i> Fingerprint</span><span class="status-val">Chrome Spoofing</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-network"></i> پروتکل</span><span class="status-val">VLESS over WebSocket</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-key"></i> هش رمز عبور</span><span class="status-val">SHA-256 + Salt</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-cookie"></i> سشن</span><span class="status-val">HttpOnly Cookie · 7 روز</span></div>
       </div>
       <div class="card">
         <div class="card-title"><i class="ti ti-shield-check"></i> کنترل دسترسی</div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-toggle-right"></i> فعال/غیرفعال‌سازی هر لینک</span><span class="status-val" style="color:var(--green-text)">پشتیبانی می‌شود</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-gauge"></i> محدودیت سهمیه ترافیک</span><span class="status-val" style="color:var(--green-text)">پشتیبانی می‌شود</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-ban"></i> قطع خودکار پس از اتمام سهمیه</span><span class="status-val" style="color:var(--green-text)">فعال</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-eye-off"></i> عدم ذخیره محتوای ترافیک</span><span class="status-val" style="color:var(--green-text)">فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-toggle-right"></i> فعال/غیرفعال لینک</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-gauge"></i> سهمیه ترافیک</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-calendar-x"></i> تاریخ انقضا</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-ban"></i> قطع خودکار</span><span class="status-val" style="color:var(--green-text)">● فعال</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-eye-off"></i> ذخیره محتوا</span><span class="status-val" style="color:var(--green-text)">● خیر</span></div>
       </div>
     </div>
-
     <div class="callout amber">
       <i class="ti ti-alert-triangle"></i>
-      <span>توجه: تمام لینک‌های ساخته‌شده، آمار مصرف و رمز عبور پنل به‌صورت <b>درون‌حافظه (in-memory)</b> ذخیره می‌شوند و با ری‌استارت شدن سرویس روی Railway، به مقادیر پیش‌فرض بازخواهند گشت (رمز پیش‌فرض: 123456). برای ذخیره دائمی، نیاز به اتصال یک دیتابیس (مثل Redis یا PostgreSQL) است.</span>
+      <span>تمام اطلاعات <b>in-memory</b> ذخیره می‌شوند. با ری‌استارت Railway همه لینک‌ها و آمارها حذف خواهند شد. برای ذخیره دائمی، Redis یا PostgreSQL اضافه کنید.</span>
     </div>
   </section>
 
-  <!-- ═══════ ERRORS PAGE ═══════ -->
+  <!-- ═══ ERRORS ═══ -->
   <section class="page" id="page-errors">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-alert-triangle"></i> خطاها</div>
-        <div class="topbar-sub">آخرین خطاهای ثبت‌شده توسط سرویس</div>
+        <div class="topbar-sub">آخرین خطاهای ثبت‌شده</div>
       </div>
       <div class="topbar-right">
         <span class="badge badge-red" id="errors-count-badge">۰ خطا</span>
-        <button class="btn btn-primary" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
+        <button class="btn btn-primary btn-sm" onclick="refreshAll()"><i class="ti ti-refresh"></i> رفرش</button>
       </div>
     </div>
-
     <div class="card">
-      <div class="card-title"><i class="ti ti-bug"></i> لاگ خطاهای اخیر</div>
-      <div id="errors-list-full" style="font-size:12px;color:var(--blue-400)">در حال بارگذاری...</div>
+      <div class="card-title"><i class="ti ti-bug"></i> لاگ خطاها</div>
+      <div id="errors-list-full">در حال بارگذاری...</div>
     </div>
   </section>
 
-  <!-- ═══════ IDEAS PAGE ═══════ -->
+  <!-- ═══ IDEAS ═══ -->
   <section class="page" id="page-ideas">
     <div class="topbar">
       <div>
-        <div class="topbar-title"><i class="ti ti-bulb"></i> ایده‌ها و قابلیت‌های پیشنهادی</div>
-        <div class="topbar-sub">پیشنهاد برای توسعه‌های بعدی RVG Gateway</div>
+        <div class="topbar-title"><i class="ti ti-bulb"></i> ایده‌ها و قابلیت‌ها</div>
+        <div class="topbar-sub">قابلیت‌های فعال و پیشنهادی Gateway</div>
       </div>
     </div>
-
     <div class="idea-grid">
+      <div class="idea-card">
+        <div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-rss"></i></div>
+        <div class="idea-title">سابسکریپشن اختصاصی</div>
+        <div class="idea-desc">هر لینک دارای URL سابسکریپشن مستقل است. کاربر می‌تواند در هر اپلیکیشن سازگار، کانفیگ را آپدیت خودکار کند.</div>
+        <span class="idea-badge done">آماده در v7</span>
+      </div>
+      <div class="idea-card">
+        <div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-calendar-x"></i></div>
+        <div class="idea-title">تاریخ انقضا برای لینک</div>
+        <div class="idea-desc">امکان تعیین روز انقضا برای هر لینک. پس از پایان مدت، اتصال به‌صورت خودکار مسدود می‌شود.</div>
+        <span class="idea-badge done">آماده در v7</span>
+      </div>
+      <div class="idea-card">
+        <div class="idea-icon" style="background:var(--green-bg);color:var(--green)"><i class="ti ti-lock-access"></i></div>
+        <div class="idea-title">پنل ادمین امن</div>
+        <div class="idea-desc">ورود با رمز عبور، سشن HttpOnly، تغییر رمز از داخل پنل و باطل‌شدن سشن‌های قدیمی.</div>
+        <span class="idea-badge done">آماده</span>
+      </div>
       <div class="idea-card">
         <div class="idea-icon"><i class="ti ti-database"></i></div>
         <div class="idea-title">ذخیره‌سازی دائمی با Redis</div>
-        <div class="idea-desc">اتصال لینک‌ها و آمار مصرف به Redis یا SQLite تا با ری‌استارت سرویس، اطلاعات حفظ شوند.</div>
-        <span class="idea-badge">پیشنهادی</span>
-      </div>
-      <div class="idea-card">
-        <div class="idea-icon"><i class="ti ti-calendar-time"></i></div>
-        <div class="idea-title">انقضای زمانی لینک</div>
-        <div class="idea-desc">علاوه بر سهمیه حجمی، امکان تعیین تاریخ انقضا برای هر لینک (مثلاً ۳۰ روزه).</div>
-        <span class="idea-badge">پیشنهادی</span>
+        <div class="idea-desc">اتصال لینک‌ها، آمار و رمز عبور به Redis تا با ری‌استارت Railway حذف نشوند.</div>
+        <span class="idea-badge suggest">پیشنهادی</span>
       </div>
       <div class="idea-card">
         <div class="idea-icon"><i class="ti ti-brand-telegram"></i></div>
         <div class="idea-title">اعلان تلگرامی مصرف</div>
-        <div class="idea-desc">ارسال پیام به کانال/بات تلگرام هنگام رسیدن مصرف هر لینک به ۸۰٪ و ۱۰۰٪ سهمیه.</div>
-        <span class="idea-badge">پیشنهادی</span>
+        <div class="idea-desc">ارسال پیام هنگام رسیدن مصرف هر لینک به ۸۰٪ و ۱۰۰٪ سهمیه از طریق Bot API تلگرام.</div>
+        <span class="idea-badge suggest">پیشنهادی</span>
+      </div>
+      <div class="idea-card">
+        <div class="idea-icon"><i class="ti ti-calendar-time"></i></div>
+        <div class="idea-title">تمدید خودکار لینک</div>
+        <div class="idea-desc">ریست خودکار سهمیه در ابتدای هر ماه یا دوره تعیین‌شده برای کاربران ماهانه.</div>
+        <span class="idea-badge suggest">پیشنهادی</span>
       </div>
       <div class="idea-card">
         <div class="idea-icon"><i class="ti ti-users"></i></div>
-        <div class="idea-title">پروفایل کاربران چندگانه</div>
-        <div class="idea-desc">گروه‌بندی لینک‌ها زیر نام کاربران مختلف برای مدیریت تیمی و گزارش‌گیری جدا.</div>
-        <span class="idea-badge">پیشنهادی</span>
+        <div class="idea-title">پروفایل کاربران</div>
+        <div class="idea-desc">گروه‌بندی لینک‌ها زیر نام کاربران مختلف با گزارش مصرف جداگانه و مدیریت تیمی.</div>
+        <span class="idea-badge suggest">پیشنهادی</span>
       </div>
       <div class="idea-card">
         <div class="idea-icon"><i class="ti ti-route"></i></div>
-        <div class="idea-title">چند مسیر خروجی (Multi-Outbound)</div>
+        <div class="idea-title">Multi-Outbound (چند خروجی)</div>
         <div class="idea-desc">اضافه‌کردن چند سرور خروجی و انتخاب هوشمند بر اساس کمترین تأخیر برای هر کاربر.</div>
-        <span class="idea-badge">پیشنهادی</span>
-      </div>
-      <div class="idea-card">
-        <div class="idea-icon"><i class="ti ti-qrcode"></i></div>
-        <div class="idea-title">QR Code اختصاصی هر لینک</div>
-        <div class="idea-desc">نمایش QR هر لینک به‌صورت کارت قابل دانلود برای اشتراک‌گذاری سریع با کاربر نهایی.</div>
-        <span class="idea-badge">آماده در نسخه فعلی</span>
+        <span class="idea-badge suggest">پیشنهادی</span>
       </div>
       <div class="idea-card">
         <div class="idea-icon"><i class="ti ti-chart-pie-2"></i></div>
-        <div class="idea-title">گزارش مصرف روزانه/ماهانه</div>
-        <div class="idea-desc">نمودار تجمعی مصرف هر لینک به تفکیک روز و ماه برای آنالیز دقیق‌تر.</div>
-        <span class="idea-badge">پیشنهادی</span>
-      </div>
-      <div class="idea-card">
-        <div class="idea-icon"><i class="ti ti-lock-access"></i></div>
-        <div class="idea-title">رمز ورود به داشبورد</div>
-        <div class="idea-desc">سیستم لاگین با سشن و امکان تغییر رمز از داخل پنل — اکنون فعال است.</div>
-        <span class="idea-badge">آماده در نسخه فعلی</span>
-      </div>
-      <div class="idea-card">
-        <div class="idea-icon"><i class="ti ti-server-2"></i></div>
-        <div class="idea-title">Load Balancing چند سرور</div>
-        <div class="idea-desc">امکان معرفی چند نمونه Railway و توزیع اتصالات بین آن‌ها برای افزایش ظرفیت.</div>
-        <span class="idea-badge">پیشنهادی</span>
+        <div class="idea-title">گزارش روزانه / ماهانه</div>
+        <div class="idea-desc">نمودار تجمعی مصرف هر لینک به تفکیک روز و ماه با امکان export CSV.</div>
+        <span class="idea-badge suggest">پیشنهادی</span>
       </div>
     </div>
   </section>
 
-  <!-- ═══════ TEST WS PAGE ═══════ -->
+  <!-- ═══ TEST WS ═══ -->
   <section class="page" id="page-testws">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-wifi"></i> تست WebSocket</div>
-        <div class="topbar-sub">بررسی سریع اتصال WebSocket به Gateway</div>
+        <div class="topbar-sub">بررسی سریع اتصال WebSocket</div>
       </div>
     </div>
-
     <div class="card" style="max-width:680px">
-      <div class="form-row" style="margin-bottom:14px">
+      <div class="form-row" style="margin-bottom:13px">
         <div class="form-group" style="flex:1">
-          <label class="form-label">UUID (خالی = تصادفی)</label>
-          <input class="form-input" id="ws-uuid" placeholder="UUID لینک" style="width:100%">
+          <label class="form-label">UUID</label>
+          <input class="form-input" id="ws-uuid" placeholder="UUID لینک (خالی = رندوم)" style="width:100%">
         </div>
         <button class="btn btn-primary" onclick="wsConnect()"><i class="ti ti-plug-connected"></i> اتصال</button>
         <button class="btn btn-danger" onclick="wsDisconnect()"><i class="ti ti-plug-x"></i> قطع</button>
       </div>
-      <div class="form-row" style="margin-bottom:14px">
+      <div class="form-row" style="margin-bottom:13px">
         <input class="form-input" id="ws-msg" placeholder="پیام تست..." style="flex:1">
         <button class="btn btn-outline" onclick="wsSend()"><i class="ti ti-send"></i> ارسال</button>
       </div>
-      <div style="background:var(--blue-900);border-radius:11px;padding:16px;height:260px;overflow-y:auto;font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.9" id="ws-log">
-        <p style="color:var(--blue-200)">منتظر اتصال...</p>
+      <div style="background:rgba(0,0,0,0.4);border:1px solid var(--card-border);border-radius:11px;padding:16px;height:260px;overflow-y:auto;font-family:ui-monospace,monospace;font-size:11px;line-height:1.9" id="ws-log">
+        <p style="color:var(--text-3)">منتظر اتصال...</p>
       </div>
     </div>
   </section>
 
-  <!-- ═══════ SETTINGS PAGE ═══════ -->
+  <!-- ═══ SETTINGS ═══ -->
   <section class="page" id="page-settings">
     <div class="topbar">
       <div>
         <div class="topbar-title"><i class="ti ti-settings"></i> تنظیمات</div>
-        <div class="topbar-sub">اطلاعات کلی سرویس RVG Gateway</div>
+        <div class="topbar-sub">اطلاعات سرور و مدیریت دسترسی</div>
       </div>
     </div>
-
     <div class="grid2">
       <div class="card">
         <div class="card-title"><i class="ti ti-server"></i> اطلاعات سرور</div>
         <div class="status-row"><span class="status-key"><i class="ti ti-world"></i> دامنه</span><span class="status-val" id="set-host">—</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-route"></i> پورت اتصال</span><span class="status-val">443 (TLS)</span></div>
-        <div class="status-row"><span class="status-key"><i class="ti ti-versions"></i> نسخه</span><span class="status-val">RVG Gateway v6.0</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-route"></i> پورت</span><span class="status-val">443 (TLS)</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-versions"></i> نسخه</span><span class="status-val">RVG Gateway v7.0</span></div>
         <div class="status-row"><span class="status-key"><i class="ti ti-brand-fastapi"></i> فریم‌ورک</span><span class="status-val">FastAPI + Uvicorn</span></div>
         <div class="status-row"><span class="status-key"><i class="ti ti-cloud"></i> پلتفرم</span><span class="status-val">Railway</span></div>
+        <div class="status-row"><span class="status-key"><i class="ti ti-rss"></i> Sub (همه لینک‌ها)</span><span class="status-val"><code style="font-size:10px;color:var(--accent-2)">/sub-all</code></span></div>
       </div>
-
       <div class="card">
-        <div class="card-title"><i class="ti ti-key"></i> تغییر رمز عبور پنل</div>
-        <div class="form-group" style="margin-bottom:14px">
+        <div class="card-title"><i class="ti ti-key"></i> تغییر رمز عبور</div>
+        <div class="form-group" style="margin-bottom:12px">
           <label class="form-label">رمز فعلی</label>
           <input class="form-input" type="password" id="cp-current" placeholder="رمز فعلی" style="width:100%">
         </div>
-        <div class="form-group" style="margin-bottom:14px">
+        <div class="form-group" style="margin-bottom:12px">
           <label class="form-label">رمز جدید</label>
           <input class="form-input" type="password" id="cp-new" placeholder="حداقل ۴ کاراکتر" style="width:100%">
         </div>
@@ -1381,22 +1819,12 @@ a{color:inherit}
           <label class="form-label">تکرار رمز جدید</label>
           <input class="form-input" type="password" id="cp-confirm" placeholder="تکرار رمز جدید" style="width:100%">
         </div>
-        <button class="btn btn-primary" onclick="changePassword()" style="width:100%;justify-content:center"><i class="ti ti-key"></i> تغییر رمز عبور</button>
-        <div class="callout" style="margin-top:14px">
+        <button class="btn btn-primary" onclick="changePassword()" style="width:100%;justify-content:center"><i class="ti ti-key"></i> تغییر رمز</button>
+        <div class="callout" style="margin-top:13px">
           <i class="ti ti-info-circle"></i>
-          <span>رمز پیش‌فرض پنل <b>123456</b> است. پس از تغییر رمز، تمام سشن‌های دیگر باطل می‌شوند و باید مجدداً وارد شوید.</span>
+          <span>پس از تغییر رمز، تمام سشن‌های دیگر باطل می‌شوند. رمز پیش‌فرض: <b>123456</b></span>
         </div>
       </div>
-    </div>
-
-    <div class="card" style="margin-top:14px">
-      <div class="card-title"><i class="ti ti-brand-telegram"></i> ارتباط با ما</div>
-      <div style="font-size:12.5px;color:var(--blue-700);line-height:1.9;margin-bottom:14px">
-        برای دریافت آخرین آپدیت‌ها، آموزش‌ها و پشتیبانی پروژه‌های شبکه و برنامه‌نویسی، به کانال تلگرام <b>codebox</b> بپیوندید.
-      </div>
-      <a class="tg-btn" href="https://t.me/CodeBoxo" target="_blank" rel="noopener" style="max-width:240px">
-        <i class="ti ti-brand-telegram"></i> پیوستن به @CodeBoxo
-      </a>
     </div>
   </section>
 
@@ -1405,126 +1833,121 @@ a{color:inherit}
 <script>
 let trafficChart, donutChart, trafficChartBig;
 let prevTraffic = 0;
-let vlessLinkText = '';
 let ws;
+let currentHost = location.host;
 
-function toast(msg, isErr){
+/* ── Toast ── */
+function toast(msg, type=''){
   const t=document.getElementById('toast');
   t.textContent=msg;
-  t.className='toast show'+(isErr?' err':'');
-  setTimeout(()=>t.classList.remove('show'),2200);
+  t.className='toast show'+(type?' '+type:'');
+  setTimeout(()=>t.classList.remove('show'),2400);
 }
 
-function fmt(n){ return n>=1000?`${(n/1000).toFixed(1)}k`:n; }
+/* ── Utils ── */
+function fmt(n){return n>=1000?`${(n/1000).toFixed(1)}k`:n}
 function fmtBytes(b){
-  if(b===0) return '0 B';
-  if(b<1024) return b+' B';
-  if(b<1024*1024) return (b/1024).toFixed(1)+' KB';
-  if(b<1024*1024*1024) return (b/(1024*1024)).toFixed(2)+' MB';
+  if(b===0)return '0 B';
+  if(b<1024)return b+' B';
+  if(b<1024*1024)return (b/1024).toFixed(1)+' KB';
+  if(b<1024*1024*1024)return (b/(1024*1024)).toFixed(2)+' MB';
   return (b/(1024*1024*1024)).toFixed(2)+' GB';
 }
+function toFa(n){return n.toString().replace(/\d/g,d=>'۰۱۲۳۴۵۶۷۸۹'[d])}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 
-/* ───────── Auth Guard ───────── */
+function daysLeft(expiresAt){
+  if(!expiresAt) return null;
+  const diff = new Date(expiresAt) - new Date();
+  return Math.ceil(diff / (1000*60*60*24));
+}
+function expiryBadge(expiresAt, expired){
+  if(expired) return `<span class="expiry-badge expiry-exp"><i class="ti ti-calendar-x"></i> منقضی</span>`;
+  if(!expiresAt) return `<span class="expiry-badge expiry-none"><i class="ti ti-infinity"></i> بی‌نهایت</span>`;
+  const d = daysLeft(expiresAt);
+  if(d<=3) return `<span class="expiry-badge expiry-warn"><i class="ti ti-alert-triangle"></i> ${toFa(d)} روز</span>`;
+  const date = new Date(expiresAt).toLocaleDateString('fa-IR');
+  return `<span class="expiry-badge expiry-ok"><i class="ti ti-calendar-check"></i> ${date}</span>`;
+}
+
+/* ── Auth ── */
 async function checkAuth(){
   try{
     const r=await fetch('/api/me');
     const d=await r.json();
-    if(!d.authenticated){
-      location.href='/login';
-    }
-  }catch(e){
-    location.href='/login';
-  }
+    if(!d.authenticated) location.href='/login';
+  }catch(e){location.href='/login'}
 }
-
 async function logout(){
-  try{ await fetch('/api/logout',{method:'POST'}); }catch(e){}
+  try{await fetch('/api/logout',{method:'POST'})}catch(e){}
   location.href='/login';
 }
-document.getElementById('logout-btn').addEventListener('click', logout);
+document.getElementById('logout-btn').addEventListener('click',logout);
 
-/* ───────── Change Password ───────── */
+/* ── Change Password ── */
 async function changePassword(){
   const cur=document.getElementById('cp-current').value;
   const nw=document.getElementById('cp-new').value;
   const cf=document.getElementById('cp-confirm').value;
-
-  if(!cur || !nw || !cf){ toast('✗ همه فیلدها را پر کنید', true); return; }
-  if(nw.length<4){ toast('✗ رمز جدید باید حداقل ۴ کاراکتر باشد', true); return; }
-  if(nw!==cf){ toast('✗ رمز جدید و تکرار آن یکسان نیستند', true); return; }
-
+  if(!cur||!nw||!cf){toast('همه فیلدها را پر کنید','err');return}
+  if(nw.length<4){toast('رمز جدید حداقل ۴ کاراکتر','err');return}
+  if(nw!==cf){toast('تکرار رمز اشتباه است','err');return}
   try{
-    const r=await fetch('/api/change-password',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({current_password:cur,new_password:nw})
-    });
+    const r=await authFetch('/api/change-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({current_password:cur,new_password:nw})});
     const d=await r.json().catch(()=>({}));
-    if(!r.ok) throw new Error(d.detail||'خطا در تغییر رمز');
-    toast('✓ رمز عبور با موفقیت تغییر کرد');
-    document.getElementById('cp-current').value='';
-    document.getElementById('cp-new').value='';
-    document.getElementById('cp-confirm').value='';
-  }catch(e){ toast('✗ '+e.message, true); }
+    if(!r.ok) throw new Error(d.detail||'خطا');
+    toast('رمز عبور تغییر کرد','ok');
+    ['cp-current','cp-new','cp-confirm'].forEach(id=>document.getElementById(id).value='');
+  }catch(e){toast('✗ '+e.message,'err')}
 }
 
-/* ───────── Mobile Sidebar ───────── */
+/* ── Mobile Sidebar ── */
 const sidebar=document.getElementById('sidebar');
 const overlay=document.getElementById('sidebar-overlay');
-function openSidebar(){
-  sidebar.classList.add('open');
-  overlay.classList.add('show');
-}
-function closeSidebar(){
-  sidebar.classList.remove('open');
-  overlay.classList.remove('show');
-}
-document.getElementById('open-sidebar-btn').addEventListener('click', openSidebar);
-document.getElementById('close-sidebar-btn').addEventListener('click', closeSidebar);
-overlay.addEventListener('click', closeSidebar);
+function openSidebar(){sidebar.classList.add('open');overlay.classList.add('show')}
+function closeSidebar(){sidebar.classList.remove('open');overlay.classList.remove('show')}
+document.getElementById('open-sidebar-btn').addEventListener('click',openSidebar);
+document.getElementById('close-sidebar-btn').addEventListener('click',closeSidebar);
+overlay.addEventListener('click',closeSidebar);
 
-/* ───────── Navigation ───────── */
+/* ── Navigation ── */
 function switchPage(name){
-  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active', n.dataset.page===name));
-  document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active', p.id==='page-'+name));
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===name));
+  document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id==='page-'+name));
   if(name==='links') loadLinks();
   if(name==='connections') loadConnections();
   if(name==='errors') loadErrorsFull();
+  if(name==='subscriptions') loadSubscriptions();
   closeSidebar();
-  window.scrollTo({top:0, behavior:'smooth'});
+  window.scrollTo({top:0,behavior:'smooth'});
 }
 document.querySelectorAll('.nav-item').forEach(item=>{
-  item.addEventListener('click', ()=>switchPage(item.dataset.page));
+  item.addEventListener('click',()=>switchPage(item.dataset.page));
 });
 
-/* ───────── Fetch wrapper with auth handling ───────── */
-async function authFetch(url, opts){
-  const r=await fetch(url, opts);
-  if(r.status===401){
-    location.href='/login';
-    throw new Error('unauthorized');
-  }
+/* ── Fetch with auth ── */
+async function authFetch(url,opts){
+  const r=await fetch(url,opts);
+  if(r.status===401){location.href='/login';throw new Error('unauthorized')}
   return r;
 }
 
-/* ───────── Stats / Charts ───────── */
+/* ── Stats ── */
 async function fetchStats(){
   try{
     const r=await authFetch('/stats');
     const d=await r.json();
-
     document.getElementById('m-conns').textContent=d.active_connections;
     document.getElementById('conns-count-badge').textContent=d.active_connections;
     document.getElementById('m-traffic').innerHTML=`${d.total_traffic_mb.toFixed(1)}<span class="metric-unit">MB</span>`;
-    document.getElementById('m-reqs').textContent=fmt(d.total_requests);
+    document.getElementById('m-active-links').textContent=d.active_links||'—';
+    document.getElementById('m-links-sub').textContent=`از ${d.links_count||0} لینک کل`;
     document.getElementById('m-errors').textContent=d.total_errors;
     document.getElementById('errors-count-badge').textContent=`${d.total_errors} خطا`;
     document.getElementById('uptime-inline').textContent=d.uptime||'—';
     document.getElementById('uptime-badge').textContent=`Railway · ${d.uptime||'—'}`;
     document.getElementById('last-update').textContent=`آخرین بروزرسانی: ${new Date().toLocaleTimeString('fa-IR')}`;
-    document.getElementById('conns-live-badge').innerHTML=`<span class="dot dot-green pulse"></span> ${d.active_connections} اتصال زنده`;
-
-    // traffic page
+    document.getElementById('conns-live-badge').innerHTML=`<span class="dot dot-green pulse"></span> ${d.active_connections} اتصال`;
     document.getElementById('t-traffic').innerHTML=`${d.total_traffic_mb.toFixed(1)}<span class="metric-unit">MB</span>`;
 
     const delta=d.total_traffic_mb-prevTraffic;
@@ -1536,8 +1959,8 @@ async function fetchStats(){
     if(d.hourly){
       const labels=Object.keys(d.hourly).sort();
       const vals=labels.map(k=>+(d.hourly[k]/(1024*1024)).toFixed(2));
-      [trafficChart, trafficChartBig].forEach(ch=>{
-        if(!ch) return;
+      [trafficChart,trafficChartBig].forEach(ch=>{
+        if(!ch)return;
         ch.data.labels=labels;
         ch.data.datasets[0].data=vals;
         ch.update();
@@ -1549,39 +1972,25 @@ async function fetchStats(){
         document.getElementById('t-peak').innerHTML=`${peak.toFixed(2)}<span class="metric-unit">MB</span>`;
       }
     }
-
     renderErrors(d.recent_errors||[]);
-  }catch(e){ console.error(e); }
+  }catch(e){console.error(e)}
 }
 
 function renderErrors(errors){
-  const el=document.getElementById('errors-list');
-  const elFull=document.getElementById('errors-list-full');
+  const el=document.getElementById('errors-list-full');
   if(errors.length){
-    const html5=errors.slice(-5).reverse().map(e=>`
+    if(el) el.innerHTML=errors.slice().reverse().map(e=>`
       <div class="err-row">
-        <div class="err-time"><i class="ti ti-clock" style="font-size:11px"></i> ${new Date(e.time).toLocaleString('fa-IR')}</div>
-        <div class="err-msg">${escapeHtml(e.error)}</div>
-      </div>`).join('');
-    const htmlAll=errors.slice().reverse().map(e=>`
-      <div class="err-row">
-        <div class="err-time"><i class="ti ti-clock" style="font-size:11px"></i> ${new Date(e.time).toLocaleString('fa-IR')}</div>
+        <div class="err-time"><i class="ti ti-clock"></i> ${new Date(e.time).toLocaleString('fa-IR')}</div>
         <div class="err-msg">${escapeHtml(e.error)}${e.url?' — '+escapeHtml(e.url):''}</div>
       </div>`).join('');
-    if(el) el.innerHTML=html5;
-    if(elFull) elFull.innerHTML=htmlAll;
   } else {
-    const okHtml='<div style="color:var(--green-text);padding:12px 0;display:flex;align-items:center;gap:6px"><i class="ti ti-circle-check"></i> هیچ خطایی ثبت نشده</div>';
-    if(el) el.innerHTML=okHtml;
-    if(elFull) elFull.innerHTML=okHtml;
+    const ok='<div style="color:var(--green-text);padding:12px;display:flex;align-items:center;gap:6px;font-size:12.5px"><i class="ti ti-circle-check"></i> هیچ خطایی ثبت نشده</div>';
+    if(el) el.innerHTML=ok;
   }
 }
 
-function escapeHtml(s){
-  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-/* ───────── Links Management ───────── */
+/* ── Links ── */
 async function loadLinks(){
   try{
     const r=await authFetch('/api/links');
@@ -1591,8 +2000,8 @@ async function loadLinks(){
     const links=d.links||[];
 
     document.getElementById('links-count-badge').textContent=links.length;
-    document.getElementById('links-page-count').textContent=`${toFa(links.length)} لینک ساخته شده`;
-    document.getElementById('links-summary-badge').textContent=`${toFa(links.length)} لینک`;
+    document.getElementById('links-page-count').textContent=`${toFa(links.length)} لینک`;
+    document.getElementById('links-summary-badge').textContent=toFa(links.length);
 
     if(!links.length){
       tbody.innerHTML='';
@@ -1601,124 +2010,175 @@ async function loadLinks(){
       empty.style.display='none';
       tbody.innerHTML=links.map(l=>{
         const limitTxt = l.limit_bytes===0 ? 'بی‌نهایت' : fmtBytes(l.limit_bytes);
-        const pct = l.limit_bytes===0 ? 0 : Math.min(100, (l.used_bytes/l.limit_bytes)*100);
-        const barColor = pct>90 ? 'var(--red-dot)' : pct>70 ? 'var(--amber-dot)' : 'var(--blue-400)';
+        const pct = l.limit_bytes===0 ? 0 : Math.min(100,(l.used_bytes/l.limit_bytes)*100);
+        const barColor = pct>90 ? 'var(--red)' : pct>70 ? 'var(--amber)' : 'var(--accent)';
+        const statusIcon = l.expired ? 'ti-calendar-x' : (l.active ? 'ti-circle-check' : 'ti-circle-x');
+        const statusColor = l.expired ? 'var(--amber)' : (l.active ? 'var(--green)' : 'var(--red)');
         return `
         <tr>
-          <td><b>${escapeHtml(l.label)}</b><div style="font-size:10px;color:var(--blue-400);margin-top:2px">${new Date(l.created_at).toLocaleString('fa-IR')}</div></td>
-          <td><span class="link-uuid">${l.uuid}</span></td>
           <td>
-            <div class="usage-bar-wrap">
+            <div class="link-label">${escapeHtml(l.label)}</div>
+            <div class="link-meta">
+              <span>${new Date(l.created_at).toLocaleDateString('fa-IR')}</span>
+              ${l.note ? `<span title="${escapeHtml(l.note)}"><i class="ti ti-note"></i> ${escapeHtml(l.note.slice(0,30))}${l.note.length>30?'...':''}</span>` : ''}
+            </div>
+          </td>
+          <td><span class="link-uuid">${l.uuid.slice(0,13)}...</span></td>
+          <td>
+            <div style="width:130px">
               <div class="usage-bar"><div class="usage-bar-fill" style="width:${pct}%;background:${barColor}"></div></div>
               <div class="usage-text">${fmtBytes(l.used_bytes)} / ${limitTxt}</div>
             </div>
           </td>
+          <td>${expiryBadge(l.expires_at, l.expired)}</td>
           <td>
-            <button class="toggle ${l.active?'on':''}" onclick="toggleLink('${l.uuid}', ${!l.active})" title="فعال/غیرفعال"></button>
+            <button class="toggle ${l.active&&!l.expired?'on':''}" onclick="toggleActive('${l.uuid}',${!l.active})" title="${l.active?'غیرفعال کن':'فعال کن'}"></button>
           </td>
-          <td style="white-space:nowrap">
-            <button class="btn btn-sm btn-light-outline" onclick="copyVless('${l.vless_link.replace(/'/g,"\\'")}')"><i class="ti ti-copy"></i> کپی</button>
-            <button class="btn btn-sm btn-light-outline" onclick="qrForText('${l.vless_link.replace(/'/g,"\\'")}')"><i class="ti ti-qrcode"></i></button>
-            <button class="btn btn-sm btn-light-outline" onclick="resetUsage('${l.uuid}')"><i class="ti ti-rotate"></i></button>
-            <button class="btn btn-sm btn-danger" onclick="deleteLink('${l.uuid}')"><i class="ti ti-trash"></i></button>
+          <td>
+            <div style="display:flex;gap:5px;flex-wrap:nowrap">
+              <button class="btn btn-sm btn-ghost" onclick="copyVless('${escapeHtml(l.vless_link).replace(/'/g,"\\'")}')"><i class="ti ti-copy"></i></button>
+              <button class="btn btn-sm btn-ghost" onclick="copySubUrl('${escapeHtml(l.sub_url)}')" title="کپی لینک سابسکریپشن"><i class="ti ti-rss"></i></button>
+              <button class="btn btn-sm btn-ghost" onclick="qrForText('${l.vless_link.replace(/'/g,"\\'")}')"><i class="ti ti-qrcode"></i></button>
+              <button class="btn btn-sm btn-ghost" onclick="resetUsage('${l.uuid}')" title="ریست مصرف"><i class="ti ti-rotate"></i></button>
+              <button class="btn btn-sm btn-danger" onclick="deleteLink('${l.uuid}')"><i class="ti ti-trash"></i></button>
+            </div>
           </td>
         </tr>`;
       }).join('');
     }
 
-    // overview summary
+    // Overview summary
     const sumEl=document.getElementById('links-summary-list');
     if(!links.length){
-      sumEl.innerHTML='هنوز لینکی ساخته نشده.';
+      sumEl.innerHTML='<div class="empty-state"><i class="ti ti-link-off"></i><p>لینکی وجود ندارد</p></div>';
     } else {
-      sumEl.innerHTML=links.slice(0,5).map(l=>{
+      sumEl.innerHTML=links.slice(0,6).map(l=>{
         const limitTxt = l.limit_bytes===0 ? 'بی‌نهایت' : fmtBytes(l.limit_bytes);
+        const color = l.expired ? 'var(--amber)' : (l.active ? 'var(--green)' : 'var(--red)');
         return `<div class="status-row">
-          <span class="status-key"><i class="ti ${l.active?'ti-circle-check':'ti-circle-x'}" style="color:${l.active?'var(--green-dot)':'var(--red-dot)'}"></i> ${escapeHtml(l.label)}</span>
-          <span class="status-val">${fmtBytes(l.used_bytes)} / ${limitTxt}</span>
+          <span class="status-key" style="gap:6px">
+            <i class="ti ${l.expired?'ti-calendar-x':l.active?'ti-circle-check':'ti-circle-x'}" style="color:${color}"></i>
+            ${escapeHtml(l.label)}
+          </span>
+          <span class="status-val" style="font-size:11px">${fmtBytes(l.used_bytes)} / ${limitTxt}</span>
         </div>`;
       }).join('');
     }
-  }catch(e){ console.error(e); }
+  }catch(e){console.error(e)}
 }
 
-function toFa(n){ return n.toString().replace(/\d/g, d=>'۰۱۲۳۴۵۶۷۸۹'[d]); }
-
 async function createLink(){
-  const label=document.getElementById('new-link-label').value.trim() || 'لینک جدید';
+  const label=document.getElementById('new-link-label').value.trim()||'لینک جدید';
   const value=document.getElementById('new-link-value').value;
   const unit=document.getElementById('new-link-unit').value;
+  const expires=document.getElementById('new-link-expires').value;
+  const note=document.getElementById('new-link-note').value.trim();
   try{
     const r=await authFetch('/api/links',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({label, limit_value:value||0, limit_unit:unit})
+      body:JSON.stringify({label,limit_value:value||0,limit_unit:unit,expires_days:expires||0,note})
     });
     if(!r.ok) throw new Error('failed');
-    document.getElementById('new-link-label').value='';
-    document.getElementById('new-link-value').value='';
-    toast('✓ لینک جدید ساخته شد');
+    ['new-link-label','new-link-value','new-link-expires','new-link-note'].forEach(id=>document.getElementById(id).value='');
+    toast('لینک جدید ساخته شد','ok');
     loadLinks();
-  }catch(e){ toast('✗ خطا در ساخت لینک', true); }
+  }catch(e){toast('خطا در ساخت لینک','err')}
 }
 
-async function toggleLink(uuid, newState){
+async function toggleActive(uuid, newState){
   try{
-    await authFetch(`/api/links/${uuid}`,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({active:newState})
-    });
-    toast(newState?'✓ لینک فعال شد':'✓ لینک غیرفعال شد');
+    await authFetch(`/api/links/${uuid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:newState})});
+    toast(newState?'لینک فعال شد':'لینک غیرفعال شد','ok');
     loadLinks();
-  }catch(e){ toast('✗ خطا', true); }
+  }catch(e){toast('خطا','err')}
 }
 
 async function resetUsage(uuid){
   try{
-    await authFetch(`/api/links/${uuid}`,{
-      method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({reset_usage:true})
-    });
-    toast('✓ مصرف ریست شد');
+    await authFetch(`/api/links/${uuid}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset_usage:true})});
+    toast('مصرف ریست شد','ok');
     loadLinks();
-  }catch(e){ toast('✗ خطا', true); }
+  }catch(e){toast('خطا','err')}
 }
 
 async function deleteLink(uuid){
   if(!confirm('آیا از حذف این لینک مطمئن هستید؟')) return;
   try{
-    await authFetch(`/api/links/${uuid}`,{method:'DELETE'});
-    toast('✓ لینک حذف شد');
+    const r=await authFetch(`/api/links/${uuid}`,{method:'DELETE'});
+    if(!r.ok) throw new Error('failed');
+    toast('لینک حذف شد','ok');
     loadLinks();
-  }catch(e){ toast('✗ خطا', true); }
+  }catch(e){toast('خطا در حذف لینک','err')}
 }
 
 function copyVless(text){
-  navigator.clipboard.writeText(text).then(()=>toast('✓ لینک کپی شد'));
+  navigator.clipboard.writeText(text).then(()=>toast('لینک VLESS کپی شد','ok'));
+}
+function copySubUrl(url){
+  navigator.clipboard.writeText(url).then(()=>toast('لینک سابسکریپشن کپی شد','ok'));
 }
 function qrForText(text){
-  window.open(`https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(text)}`,'_blank');
+  window.open(`https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(text)}`,'_blank');
 }
 
-/* ───────── Connections Page ───────── */
+/* ── Subscriptions Page ── */
+async function loadSubscriptions(){
+  const subAllUrl = `${location.protocol}//${location.host}/sub-all`;
+  document.getElementById('sub-all-url').textContent = subAllUrl;
+
+  try{
+    const r=await authFetch('/api/links');
+    const d=await r.json();
+    const links=(d.links||[]).filter(l=>l.active && !l.expired);
+    const el=document.getElementById('sub-links-list');
+    if(!links.length){
+      el.innerHTML='<div class="empty-state"><i class="ti ti-rss-off"></i><p>هیچ لینک فعالی وجود ندارد</p></div>';
+      return;
+    }
+    el.innerHTML=links.map(l=>`
+      <div style="padding:14px;background:var(--accent-dim);border:1px solid rgba(59,130,246,0.12);border-radius:10px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+          <div>
+            <div style="font-weight:600;color:var(--text-1);font-size:12.5px;margin-bottom:4px">${escapeHtml(l.label)}</div>
+            <div class="sub-url">${escapeHtml(l.sub_url)}</div>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-sm btn-ghost" onclick="copySubUrl('${escapeHtml(l.sub_url)}')"><i class="ti ti-copy"></i> کپی</button>
+            <button class="btn btn-sm btn-ghost" onclick="qrForText('${escapeHtml(l.sub_url)}')"><i class="ti ti-qrcode"></i></button>
+          </div>
+        </div>
+      </div>`).join('');
+  }catch(e){console.error(e)}
+}
+
+function copySubAll(){
+  const url=`${location.protocol}//${location.host}/sub-all`;
+  navigator.clipboard.writeText(url).then(()=>toast('آدرس سابسکریپشن کپی شد','ok'));
+}
+function openSubAll(){
+  window.open(`${location.protocol}//${location.host}/sub-all`,'_blank');
+}
+
+/* ── Connections ── */
 async function loadConnections(){
   try{
     const r=await authFetch('/stats');
     const d=await r.json();
-    const tbody=document.getElementById('conns-tbody');
+    const list=document.getElementById('conns-list');
     const empty=document.getElementById('conns-empty');
     if(d.active_connections===0){
-      tbody.innerHTML='';
+      list.innerHTML='';
       empty.style.display='block';
     } else {
       empty.style.display='none';
-      tbody.innerHTML=`<tr><td colspan="4" style="text-align:center;color:var(--blue-400);padding:20px">
-        ${d.active_connections} اتصال فعال در حال انتقال داده — برای جزئیات کامل هر اتصال، endpoint <code>/api/connections</code> را اضافه کنید.
-      </td></tr>`;
+      list.innerHTML=`<div class="conn-item">
+        <div class="conn-dot"></div>
+        <div style="flex:1;font-size:12px;color:var(--text-2)">${d.active_connections} اتصال فعال در حال انتقال داده</div>
+        <span class="badge badge-green">${d.total_traffic_mb.toFixed(1)} MB کل</span>
+      </div>`;
     }
-  }catch(e){ console.error(e); }
+  }catch(e){console.error(e)}
 }
 
 async function loadErrorsFull(){
@@ -1729,115 +2189,106 @@ async function loadErrorsFull(){
   }catch(e){}
 }
 
-/* ───────── VLESS overview link ───────── */
+/* ── VLESS overview ── */
 async function fetchOverviewVless(){
   try{
     const r=await authFetch('/api/links');
     const d=await r.json();
     const links=d.links||[];
-    const def = links.find(l=>l.limit_bytes===0) || links[0];
+    const def=links.find(l=>l.limit_bytes===0&&!l.expired&&l.active)||links[0];
     if(def){
-      vlessLinkText=def.vless_link;
-      document.getElementById('vless-link-overview').textContent=vlessLinkText;
+      document.getElementById('vless-link-overview').textContent=def.vless_link;
     } else {
-      document.getElementById('vless-link-overview').textContent='در حال ساخت لینک پیش‌فرض... یک‌بار رفرش کنید.';
+      document.getElementById('vless-link-overview').textContent='رفرش کنید یا لینک جدید بسازید...';
     }
-  }catch(e){ console.error(e); }
+  }catch(e){console.error(e)}
 }
 
 function copyText(elId){
   const text=document.getElementById(elId).textContent;
-  if(!text||text.includes('بارگ')){ toast('لینک هنوز آماده نیست', true); return; }
-  navigator.clipboard.writeText(text).then(()=>toast('✓ لینک کپی شد'));
+  navigator.clipboard.writeText(text).then(()=>toast('لینک کپی شد','ok'));
 }
 function qrFor(elId){
   const text=document.getElementById(elId).textContent;
-  if(!text||text.includes('بارگ')){ toast('لینک هنوز آماده نیست', true); return; }
-  window.open(`https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(text)}`,'_blank');
+  window.open(`https://api.qrserver.com/v1/create-qr-code/?size=280x280&data=${encodeURIComponent(text)}`,'_blank');
 }
 
 function refreshAll(){
   fetchStats();
   fetchOverviewVless();
   loadLinks();
-  toast('در حال رفرش...');
+  if(document.getElementById('page-subscriptions').classList.contains('active')) loadSubscriptions();
+  toast('در حال رفرش...','');
 }
 
-/* ───────── WebSocket Test ───────── */
+/* ── WebSocket Test ── */
 function wsLog(cls,msg){
   const log=document.getElementById('ws-log');
   const p=document.createElement('p');
-  const colors={ok:'#97C459',err:'#F09595',info:'#85B7EB',sent:'#FAC775'};
+  const colors={ok:'#34D399',err:'#F87171',info:'#7BAED4',sent:'#FCD34D'};
   p.style.color=colors[cls]||'#fff';
   p.textContent=`[${new Date().toLocaleTimeString('fa-IR')}] ${msg}`;
-  log.appendChild(p); log.scrollTop=log.scrollHeight;
+  log.appendChild(p);log.scrollTop=log.scrollHeight;
 }
 function wsConnect(){
   let uuid=document.getElementById('ws-uuid').value.trim()||crypto.randomUUID();
   const url=`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/${uuid}`;
-  wsLog('info',`در حال اتصال: ${url}`);
+  wsLog('info',`اتصال: ${url}`);
   ws=new WebSocket(url);
-  ws.onopen=()=>wsLog('ok','✓ اتصال برقرار شد');
-  ws.onerror=()=>wsLog('err','✗ خطا در اتصال');
-  ws.onmessage=m=>wsLog('info','دریافت داده ('+(m.data.size||m.data.length)+' بایت)');
-  ws.onclose=(e)=>wsLog('err',`اتصال قطع شد (code: ${e.code})`);
+  ws.onopen=()=>wsLog('ok','✓ اتصال برقرار');
+  ws.onerror=()=>wsLog('err','✗ خطا');
+  ws.onmessage=m=>wsLog('info','دریافت ('+(m.data.size||m.data.length)+' byte)');
+  ws.onclose=e=>wsLog('err',`قطع (code: ${e.code})`);
 }
 function wsSend(){
   const m=document.getElementById('ws-msg').value;
-  if(!m){wsLog('err','پیام خالی است');return}
+  if(!m){wsLog('err','پیام خالی');return}
   if(!ws||ws.readyState!==1){wsLog('err','ابتدا متصل شوید');return}
-  ws.send(m); wsLog('sent','ارسال: '+m);
+  ws.send(m);wsLog('sent','ارسال: '+m);
   document.getElementById('ws-msg').value='';
 }
-function wsDisconnect(){ if(ws) ws.close(); }
+function wsDisconnect(){if(ws)ws.close()}
 
-/* ───────── Charts init ───────── */
+/* ── Charts ── */
 function initCharts(){
-  const baseOpts={
+  const chartDefaults={
     responsive:true,maintainAspectRatio:false,
-    plugins:{legend:{display:false},tooltip:{callbacks:{label:v=>`${v.parsed.y.toFixed(2)} MB`}}},
+    plugins:{legend:{display:false},tooltip:{callbacks:{label:v=>`${v.parsed.y.toFixed(2)} MB`},backgroundColor:'rgba(13,27,46,0.95)',borderColor:'rgba(59,130,246,0.2)',borderWidth:1,titleColor:'#E8F4FF',bodyColor:'#7BAED4'}},
     scales:{
-      x:{grid:{color:'rgba(55,138,221,0.07)'},ticks:{color:'#378ADD',font:{size:10}}},
-      y:{grid:{color:'rgba(55,138,221,0.07)'},ticks:{color:'#378ADD',font:{size:10},callback:v=>`${v}MB`}}
+      x:{grid:{color:'rgba(59,130,246,0.04)'},ticks:{color:'#3D6B8E',font:{size:10,family:'Vazirmatn'}}},
+      y:{grid:{color:'rgba(59,130,246,0.04)'},ticks:{color:'#3D6B8E',font:{size:10},callback:v=>`${v}MB`}}
     }
   };
-  const lineData={
+  const ds={
     label:'MB',data:[],
-    borderColor:'#378ADD',
-    backgroundColor:'rgba(55,138,221,0.08)',
+    borderColor:'rgba(59,130,246,0.8)',
+    backgroundColor:'rgba(59,130,246,0.06)',
     fill:true,tension:0.45,
-    pointRadius:4,pointHoverRadius:6,
-    pointBackgroundColor:'#185FA5',
-    pointBorderColor:'#fff',pointBorderWidth:2,
-    borderWidth:2.5
+    pointRadius:3,pointHoverRadius:5,
+    pointBackgroundColor:'rgba(59,130,246,0.8)',
+    pointBorderColor:'rgba(59,130,246,0.3)',
+    borderWidth:2,
   };
-
-  trafficChart=new Chart(document.getElementById('trafficChart'),{
-    type:'line', data:{labels:[],datasets:[{...lineData}]}, options:baseOpts
-  });
-  trafficChartBig=new Chart(document.getElementById('trafficChartBig'),{
-    type:'line', data:{labels:[],datasets:[{...lineData}]}, options:baseOpts
-  });
-
+  trafficChart=new Chart(document.getElementById('trafficChart'),{type:'line',data:{labels:[],datasets:[{...ds}]},options:chartDefaults});
+  trafficChartBig=new Chart(document.getElementById('trafficChartBig'),{type:'line',data:{labels:[],datasets:[{...ds}]},options:chartDefaults});
   donutChart=new Chart(document.getElementById('donutChart'),{
     type:'doughnut',
     data:{
       labels:['VLESS / WS','HTTP Proxy','سایر'],
-      datasets:[{
-        data:[70,25,5],
-        backgroundColor:['#185FA5','#378ADD','#85B7EB'],
-        borderColor:'#fff',borderWidth:2,
-        hoverOffset:6
-      }]
+      datasets:[{data:[70,25,5],backgroundColor:['rgba(59,130,246,0.8)','rgba(16,185,129,0.7)','rgba(139,92,246,0.7)'],borderColor:'rgba(0,0,0,0)',borderWidth:3,hoverOffset:8}]
     },
     options:{
-      responsive:true,maintainAspectRatio:false,cutout:'68%',
-      plugins:{legend:{position:'bottom',labels:{color:'#0C447C',font:{size:11},padding:10,usePointStyle:true,pointStyleWidth:10}}}
+      responsive:true,maintainAspectRatio:false,cutout:'70%',
+      plugins:{
+        legend:{position:'bottom',labels:{color:'#7BAED4',font:{size:10,family:'Vazirmatn'},padding:12,usePointStyle:true,pointStyleWidth:8}},
+        tooltip:{backgroundColor:'rgba(13,27,46,0.95)',borderColor:'rgba(59,130,246,0.2)',borderWidth:1}
+      }
     }
   });
 }
 
-document.addEventListener('DOMContentLoaded',async ()=>{
+/* ── Init ── */
+document.addEventListener('DOMContentLoaded',async()=>{
   await checkAuth();
   initCharts();
   document.getElementById('set-host').textContent=location.host;
@@ -1845,7 +2296,10 @@ document.addEventListener('DOMContentLoaded',async ()=>{
   fetchOverviewVless();
   loadLinks();
   setInterval(fetchStats,4000);
-  setInterval(()=>{ if(document.getElementById('page-links').classList.contains('active')) loadLinks(); }, 5000);
+  setInterval(()=>{
+    if(document.getElementById('page-links').classList.contains('active')) loadLinks();
+    if(document.getElementById('page-subscriptions').classList.contains('active')) loadSubscriptions();
+  },5000);
 });
 </script>
 </body>
