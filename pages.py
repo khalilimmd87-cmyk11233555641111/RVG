@@ -57,8 +57,8 @@ input:focus+.ic{color:var(--accent)}
 <div class="wrap">
   <div class="card">
     <div class="brand">
-      <div class="brand-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="codebox"></div>
-      <div><div class="brand-name">codebox</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
+      <div class="brand-img"><img src="https://ui-avatars.com/api/?name=TK&background=2563EB&color=fff&size=160" alt="tg_khalili"></div>
+      <div><div class="brand-name">tg_khalili</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
     </div>
     <h1>ورود به پنل</h1>
     <p class="sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
@@ -77,7 +77,7 @@ input:focus+.ic{color:var(--accent)}
       </div>
       <button class="btn" type="submit" id="btn"><i class="ti ti-login-2"></i> ورود به داشبورد</button>
     </form>
-    <div class="footer">کانال رسمی<a href="https://t.me/CodeBoxo" target="_blank"><i class="ti ti-brand-telegram"></i>@CodeBoxo</a></div>
+    <div class="footer">کانال رسمی<a href="https://t.me/timazadi" target="_blank"><i class="ti ti-brand-telegram"></i>@timazadi</a></div>
   </div>
 </div>
 <script>
@@ -103,7 +103,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RVG Gateway · codebox</title>
+<title>RVG Gateway · tg_khalili</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
@@ -377,7 +377,7 @@ a{color:inherit;text-decoration:none}
   <button class="sb-close" id="close-sb"><i class="ti ti-x"></i></button>
   <div class="logo">
     <div class="logo-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="cb"></div>
-    <div><div class="logo-name">codebox</div><div class="logo-sub">RVG Gateway · v9.0</div></div>
+    <div><div class="logo-name">tg_khalili</div><div class="logo-sub">RVG Gateway · v9.0</div></div>
   </div>
   <div class="nav-wrap">
     <div class="nav-sec">پنل</div>
@@ -395,7 +395,7 @@ a{color:inherit;text-decoration:none}
   </div>
   <div class="sb-foot">
     <button class="theme-btn" onclick="toggleTheme()"><i class="ti ti-moon" id="theme-icon"></i> <span id="theme-label">تم روشن</span></button>
-    <a class="tg-btn" href="https://t.me/CodeBoxo" target="_blank" rel="noopener"><i class="ti ti-brand-telegram"></i> @CodeBoxo</a>
+    <a class="tg-btn" href="https://t.me/timazadi" target="_blank" rel="noopener"><i class="ti ti-brand-telegram"></i> @timazadi</a>
     <button class="logout-btn" id="logout-btn"><i class="ti ti-logout"></i> خروج</button>
   </div>
 </aside>
@@ -451,8 +451,8 @@ a{color:inherit;text-decoration:none}
     </div>
   </div>
   <div class="dash-footer">
-    <span class="df-text">codebox RVG Gateway v9.0 · Railway · 2025</span>
-    <a class="df-link" href="https://t.me/CodeBoxo" target="_blank"><i class="ti ti-brand-telegram"></i> t.me/CodeBoxo</a>
+    <span class="df-text">tg_khalili RVG Gateway v9.0 · Railway · 2025</span>
+    <a class="df-link" href="https://t.me/timazadi" target="_blank"><i class="ti ti-brand-telegram"></i> t.me/timazadi</a>
   </div>
 </section>
 <section class="pg" id="pg-links">
@@ -923,7 +923,7 @@ def get_public_page_html(uuid_key: str) -> str:
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RVG Sub · codebox</title>
+<title>RVG Sub · tg_khalili</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
@@ -1014,15 +1014,15 @@ html,body{{min-height:100%;background:var(--bg);font-family:'Vazirmatn',sans-ser
 <div class="wrap">
   <div class="top">
     <div class="brand">
-      <div class="brand-img"><img src="https://yt3.googleusercontent.com/vA6bYj1V386YmibpWRNFJtsRRqwfY_U9wnb7gmW90eRVXyNB7gAfjj1XPs5UX0cdKdQprrI=s160-c-k-c0x00ffffff-no-rj" alt="cb"></div>
-      <div><div class="brand-name">codebox</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
+      <div class="brand-img"><img src="https://ui-avatars.com/api/?name=TK&background=2563EB&color=fff&size=160" alt="tg_khalili"></div>
+      <div><div class="brand-name">tg_khalili</div><div class="brand-sub">RVG Gateway · v9.0</div></div>
     </div>
-    <a href="https://t.me/CodeBoxo" target="_blank" style="display:flex;align-items:center;gap:5px;font-size:12px;color:#A78BFA;font-weight:600"><i class="ti ti-brand-telegram" style="font-size:16px"></i> @CodeBoxo</a>
+    <a href="https://t.me/timazadi" target="_blank" style="display:flex;align-items:center;gap:5px;font-size:12px;color:#A78BFA;font-weight:600"><i class="ti ti-brand-telegram" style="font-size:16px"></i> @timazadi</a>
   </div>
   <div id="root">
     <div style="text-align:center;padding:80px 20px;color:var(--t3)"><i class="ti ti-loader-2" style="font-size:38px;display:block;margin-bottom:14px;animation:spin 1s linear infinite"></i>در حال بارگذاری...</div>
   </div>
-  <div class="footer">کانال رسمی: <a href="https://t.me/CodeBoxo" target="_blank">@CodeBoxo</a> · RVG Gateway v9.0</div>
+  <div class="footer">کانال رسمی: <a href="https://t.me/timazadi" target="_blank">@timazadi</a> · RVG Gateway v9.0</div>
 </div>
 <script>
 const UUID_KEY='{uuid_key}';
