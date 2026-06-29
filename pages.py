@@ -1,5 +1,5 @@
-# pages.py  –  B2 Gateway v9.0 - طراحی فوق‌العاده
-# طراح: tg_khalili  |  کانال: @timazadi
+# pages.py  –  B2 Gateway v9.0
+# Developer: tg_khalili  |  Channel: @timazadi
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -53,7 +53,7 @@ input:focus+.ic{color:var(--accent)}
 .footer{margin-top:24px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.04);display:flex;align-items:center;justify-content:center;gap:10px;font-size:11px;color:var(--text2);position:relative;z-index:1}
 .footer a{color:var(--accent);font-weight:600;text-decoration:none;display:flex;align-items:center;gap:5px;transition:0.3s}
 .footer a:hover{color:var(--pink)}
-@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes spin{to{transform:rotate(360deg)}
 </style>
 </head>
 <body>
