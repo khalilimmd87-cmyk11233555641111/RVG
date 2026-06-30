@@ -1,17 +1,17 @@
-# pages.py  –  B2 Gateway v9.0
-# Developer: tg_khalili  |  Channel: @timazadi
+# pages.py  –  NexaGate v10.0
+# Channel: @timazadi
 
 LOGIN_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>وورود · B2 Gateway</title>
+<title>ورود · NexaGate</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-:root{--glass:rgba(255,255,255,0.05);--glass-border:rgba(255,255,255,0.08);--glass-hover:rgba(255,255,255,0.1);--glass-shadow:0 8px 50px rgba(0,0,0,0.5);--accent:#7c3aed;--accent2:#6d28d9;--accent3:#a78bfa;--accent-glow:rgba(124,58,237,0.3);--pink:#ec4899;--pink-glow:rgba(236,72,153,0.2);--blue:#3b82f6;--blue-glow:rgba(59,130,246,0.2);--green:#10b981;--text:#f1f5f9;--text2:#94a3b8;--bg1:#0c0a1a;--bg2:#1a1435;--bg3:#241b4a}
+:root{--glass:rgba(255,255,255,0.05);--glass-border:rgba(255,255,255,0.08);--glass-hover:rgba(255,255,255,0.1);--glass-shadow:0 8px 50px rgba(0,0,0,0.5);--accent:#7c3aed;--accent2:#6d28d9;--accent3:#a78bfa;--accent-glow:rgba(124,58,237,0.3);--pink:#ec4899;--pink-glow:rgba(236,72,153,0.2);--blue:#3b82f6;--blue-glow:rgba(59,130,246,0.2);--green:#10b981;--cyan:#22d3ee;--text:#f1f5f9;--text2:#94a3b8;--bg1:#0c0a1a;--bg2:#1a1435;--bg3:#241b4a}
 body{font-family:'Vazirmatn',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background:linear-gradient(135deg,var(--bg1),var(--bg2),var(--bg3));background-attachment:fixed;overflow:hidden}
 .bg-animation{position:fixed;inset:0;z-index:0;overflow:hidden}
 .bg-animation .orb{position:absolute;border-radius:50%;filter:blur(130px);animation:float 20s ease-in-out infinite}
@@ -25,8 +25,8 @@ body{font-family:'Vazirmatn',sans-serif;min-height:100vh;display:flex;align-item
 .card::after{content:'';position:absolute;bottom:-50%;left:-50%;width:100%;height:100%;background:radial-gradient(circle,rgba(236,72,153,0.03),transparent 70%);pointer-events:none}
 .card:hover{border-color:rgba(255,255,255,0.15);box-shadow:0 8px 60px rgba(0,0,0,0.6);transform:translateY(-2px)}
 .brand{display:flex;align-items:center;gap:16px;margin-bottom:30px;position:relative;z-index:1}
-.brand-icon{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--accent),var(--pink));display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:900;color:#fff;box-shadow:0 4px 30px var(--accent-glow);flex-shrink:0;position:relative}
-.brand-icon::after{content:'';position:absolute;inset:-3px;border-radius:18px;background:linear-gradient(135deg,var(--accent),var(--pink));z-index:-1;filter:blur(15px);opacity:0.5}
+.brand-icon{width:56px;height:56px;border-radius:16px;background:linear-gradient(135deg,var(--cyan),var(--accent) 55%,var(--pink));display:flex;align-items:center;justify-content:center;font-size:21px;font-weight:900;color:#fff;box-shadow:0 4px 30px var(--accent-glow);flex-shrink:0;position:relative}
+.brand-icon::after{content:'';position:absolute;inset:-3px;border-radius:18px;background:linear-gradient(135deg,var(--cyan),var(--accent) 55%,var(--pink));z-index:-1;filter:blur(15px);opacity:0.55}
 .brand-name{font-size:22px;font-weight:800;color:var(--text);letter-spacing:-0.5px;background:linear-gradient(135deg,#fff,#c4b5fd);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .brand-sub{font-size:11px;color:var(--text2);margin-top:2px;-webkit-text-fill-color:var(--text2)}
 h1{font-size:24px;font-weight:800;color:var(--text);margin-bottom:4px;position:relative;z-index:1}
@@ -61,8 +61,8 @@ input:focus+.ic{color:var(--accent)}
 <div class="wrap">
   <div class="card">
     <div class="brand">
-      <div class="brand-icon">B2</div>
-      <div><div class="brand-name">B2 Gateway</div><div class="brand-sub">نسخه ۹ · قدرتمند و سریع</div></div>
+      <div class="brand-icon">NX</div>
+      <div><div class="brand-name">NexaGate</div><div class="brand-sub">نسخه ۱۰ · سریع‌تر، امن‌تر، خفن‌تر</div></div>
     </div>
     <h1>ورود به پنل</h1>
     <p class="sub">رمز عبور را برای دسترسی به داشبورد وارد کنید</p>
@@ -107,7 +107,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B2 Gateway · tg_khalili</title>
+<title>NexaGate · پنل مدیریت</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
@@ -133,6 +133,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --red:#ef4444;
   --amber:#f59e0b;
   --purple:#8b5cf6;
+  --cyan:#22d3ee;
+  --cyan-glow:rgba(34,211,238,0.25);
   --text:#f1f5f9;
   --text2:#94a3b8;
   --text3:#64748b;
@@ -153,8 +155,8 @@ a{color:inherit;text-decoration:none}
 .sidebar{width:var(--sidebar-w);min-height:100vh;background:var(--glass);backdrop-filter:blur(50px);-webkit-backdrop-filter:blur(50px);border-left:1px solid var(--glass-border);display:flex;flex-direction:column;flex-shrink:0;position:fixed;right:0;top:0;bottom:0;z-index:200;transition:transform 0.4s cubic-bezier(0.4,0,0.2,1)}
 .sidebar:hover{border-color:var(--glass-border-hover)}
 .logo{display:flex;align-items:center;gap:14px;padding:24px 20px 18px;border-bottom:1px solid var(--glass-border)}
-.logo-icon{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--accent),var(--pink));display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;color:#fff;box-shadow:0 4px 30px var(--accent-glow);flex-shrink:0;position:relative}
-.logo-icon::after{content:'';position:absolute;inset:-3px;border-radius:16px;background:linear-gradient(135deg,var(--accent),var(--pink));z-index:-1;filter:blur(12px);opacity:0.4}
+.logo-icon{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--cyan),var(--accent) 55%,var(--pink));display:flex;align-items:center;justify-content:center;font-size:19px;font-weight:900;color:#fff;box-shadow:0 4px 30px var(--accent-glow);flex-shrink:0;position:relative}
+.logo-icon::after{content:'';position:absolute;inset:-3px;border-radius:16px;background:linear-gradient(135deg,var(--cyan),var(--accent) 55%,var(--pink));z-index:-1;filter:blur(12px);opacity:0.5}
 .logo-name{font-size:16px;font-weight:800;color:var(--text);letter-spacing:-0.3px;background:linear-gradient(135deg,#fff,#c4b5fd);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .logo-sub{font-size:10px;color:var(--text2);margin-top:1px;-webkit-text-fill-color:var(--text2)}
 .sb-close{display:none;position:absolute;left:14px;top:20px;background:rgba(255,255,255,0.04);border:1px solid var(--glass-border);color:var(--text2);width:34px;height:34px;border-radius:12px;font-size:18px;align-items:center;justify-content:center;cursor:pointer;transition:0.3s}
@@ -439,8 +441,8 @@ a{color:inherit;text-decoration:none}
 
 <div class="mob-top">
   <div class="ml">
-    <div class="mob-logo">B2</div>
-    <span class="mob-title">B2 Gateway</span>
+    <div class="mob-logo">NX</div>
+    <span class="mob-title">NexaGate</span>
   </div>
   <div class="mob-right">
     <button class="theme-mob" id="theme-mob-btn" onclick="toggleTheme()"><i class="ti ti-sun" id="theme-mob-icon"></i></button>
@@ -451,8 +453,8 @@ a{color:inherit;text-decoration:none}
 <aside class="sidebar" id="sb">
   <button class="sb-close" id="close-sb"><i class="ti ti-x"></i></button>
   <div class="logo">
-    <div class="logo-icon">B2</div>
-    <div><div class="logo-name">B2 Gateway</div><div class="logo-sub">نسخه ۹ · قدرتمند و سریع</div></div>
+    <div class="logo-icon">NX</div>
+    <div><div class="logo-name">NexaGate</div><div class="logo-sub">نسخه ۱۰ · سریع‌تر، امن‌تر، خفن‌تر</div></div>
   </div>
   <div class="nav-wrap">
     <div class="nav-sec">پنل</div>
@@ -477,7 +479,7 @@ a{color:inherit;text-decoration:none}
 <main class="main">
 <section class="pg on" id="pg-overview">
   <div class="topbar">
-    <div><div class="tb-title"><i class="ti ti-layout-dashboard"></i> داشبورد B2</div><div class="tb-sub" id="last-upd">در حال بارگذاری...</div></div>
+    <div><div class="tb-title"><i class="ti ti-layout-dashboard"></i> داشبورد NexaGate</div><div class="tb-sub" id="last-upd">در حال بارگذاری...</div></div>
     <div class="tb-right">
       <span class="badge bg-green"><span class="dot dg pulse"></span> فعال</span>
       <span class="badge bg-blue" id="uptime-badge">—</span>
@@ -526,7 +528,7 @@ a{color:inherit;text-decoration:none}
     </div>
   </div>
   <div class="dash-footer">
-    <span class="df-text">B2 Gateway v9.0 · طراحی توسط tg_khalili · 2025</span>
+    <span class="df-text">NexaGate v10.0 · 2026</span>
     <a class="df-link" href="https://t.me/timazadi" target="_blank"><i class="ti ti-brand-telegram"></i> @timazadi</a>
   </div>
 </section>
@@ -665,7 +667,7 @@ a{color:inherit;text-decoration:none}
       <div class="card-title"><i class="ti ti-server"></i> اطلاعات سرور</div>
       <div class="sr"><span class="sr-k"><i class="ti ti-world"></i> دامنه</span><span class="sr-v" id="set-host">—</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-route"></i> پورت</span><span class="sr-v">443 (TLS)</span></div>
-      <div class="sr"><span class="sr-k"><i class="ti ti-versions"></i> نسخه</span><span class="sr-v">v9.0</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-versions"></i> نسخه</span><span class="sr-v">v10.0</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-brand-fastapi"></i> فریم‌ورک</span><span class="sr-v">FastAPI + Uvicorn</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-cloud"></i> پلتفرم</span><span class="sr-v">Railway</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-device-floppy"></i> ذخیره‌سازی</span><span class="sr-v">JSON File (/data)</span></div>
@@ -1094,7 +1096,7 @@ def get_public_page_html(uuid_key: str) -> str:
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B2 Sub · tg_khalili</title>
+<title>NexaGate · سابسکریپشن</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.19.0/dist/tabler-icons.min.css">
@@ -1112,6 +1114,7 @@ def get_public_page_html(uuid_key: str) -> str:
   --accent-glow:rgba(124,58,237,0.25);
   --pink:#ec4899;
   --pink-glow:rgba(236,72,153,0.15);
+  --cyan:#22d3ee;
   --green:#10b981;
   --green-glow:rgba(16,185,129,0.12);
   --red:#ef4444;
@@ -1221,8 +1224,8 @@ html,body{{min-height:100%;background:linear-gradient(135deg,var(--bg1),var(--bg
 <div class="wrap">
   <div class="top">
     <div class="brand">
-      <div class="brand-icon">B2</div>
-      <div><div class="brand-name">B2 Gateway</div><div class="brand-sub">نسخه ۹ · قدرتمند و سریع</div></div>
+      <div class="brand-icon">NX</div>
+      <div><div class="brand-name">NexaGate</div><div class="brand-sub">نسخه ۱۰ · سریع‌تر، امن‌تر، خفن‌تر</div></div>
     </div>
     <a href="https://t.me/timazadi" target="_blank" style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--accent3);font-weight:600;transition:0.3s">
       <i class="ti ti-brand-telegram" style="font-size:16px"></i> @timazadi
@@ -1232,7 +1235,7 @@ html,body{{min-height:100%;background:linear-gradient(135deg,var(--bg1),var(--bg
     <div style="text-align:center;padding:80px 20px;color:var(--text2)"><i class="ti ti-loader-2" style="font-size:38px;display:block;margin-bottom:16px;animation:spin 1s linear infinite"></i>در حال بارگذاری...</div>
   </div>
   <div class="footer">
-    طراحی توسط <a href="https://t.me/timazadi" target="_blank">tg_khalili</a> · B2 Gateway v9.0
+    NexaGate v10.0
   </div>
 </div>
 <script>
