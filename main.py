@@ -18,9 +18,9 @@ import httpx
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("RVG-Gateway")
+logger = logging.getLogger("NexaGate")
 
-app = FastAPI(title="RVG Gateway – codebox", docs_url=None, redoc_url=None)
+app = FastAPI(title="NexaGate Gateway", docs_url=None, redoc_url=None)
 
 CONFIG = {
     "port": int(os.environ.get("PORT", 8000)),
@@ -141,7 +141,7 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
-    logger.info(f"🚀 RVG Gateway v9.0 started on port {CONFIG['port']}")
+    logger.info(f"🚀 NexaGate v10.0 started on port {CONFIG['port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -157,7 +157,7 @@ def generate_uuid() -> str:
     h = secrets.token_hex(16)
     return f"{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
 
-def generate_vless_link(uuid: str, host: str, remark: str = "RVG") -> str:
+def generate_vless_link(uuid: str, host: str, remark: str = "NexaGate") -> str:
     path = f"/ws/{uuid}"
     params = {
         "encryption": "none",
@@ -233,6 +233,8 @@ async def ensure_default_link():
                     "note": "",
                     "is_default": True,
                     "sub_id": None,
+                    "game_mode": False,
+                    "game_port": None,
                 }
                 asyncio.create_task(save_state())
         _default_link_created = True
@@ -240,7 +242,7 @@ async def ensure_default_link():
 # ── Basic endpoints ───────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"service": "RVG Gateway", "version": "9.0", "status": "active", "channel": "https://t.me/CodeBoxo"}
+    return {"service": "NexaGate Gateway", "version": "10.0", "status": "active", "channel": "https://t.me/timazadi"}
 
 @app.get("/health")
 async def health():
@@ -255,10 +257,10 @@ async def subscription_single(uuid: str):
     if not link or not is_link_allowed(link):
         raise HTTPException(status_code=404, detail="not found or inactive")
     host = get_host()
-    vless = generate_vless_link(uuid, host, remark=f"RVG-{link['label']}")
+    vless = generate_vless_link(uuid, host, remark=f"NexaGate-{link['label']}")
     content = base64.b64encode(vless.encode()).decode()
     return Response(content=content, media_type="text/plain",
-                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/CodeBoxo"})
+                    headers={"profile-title": quote(link["label"]), "support-url": "https://t.me/timazadi"})
 
 @app.get("/sub-all")
 async def subscription_all(_=Depends(require_auth)):
@@ -266,7 +268,7 @@ async def subscription_all(_=Depends(require_auth)):
     host = get_host()
     async with LINKS_LOCK:
         lines = [
-            generate_vless_link(uid, host, remark=f"RVG-{d['label']}")
+            generate_vless_link(uid, host, remark=f"NexaGate-{d['label']}")
             for uid, d in LINKS.items()
             if is_link_allowed(d)
         ]
@@ -409,7 +411,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         for lid in link_ids:
             link = LINKS.get(lid)
             if link and is_link_allowed(link):
-                lines.append(generate_vless_link(lid, host, remark=f"RVG-{link['label']}"))
+                lines.append(generate_vless_link(lid, host, remark=f"NexaGate-{link['label']}"))
 
     content = base64.b64encode("\n".join(lines).encode()).decode()
     return Response(
@@ -417,7 +419,7 @@ async def sub_group_subscription(uuid_key: str, request: Request):
         media_type="text/plain",
         headers={
             "profile-title": quote(sub["name"]),
-            "support-url": "https://t.me/CodeBoxo",
+            "support-url": "https://t.me/timazadi",
             "profile-update-interval": "12",
         }
     )
@@ -477,6 +479,7 @@ async def get_stats(_=Depends(require_auth)):
         "active_links": sum(1 for l in snap.values() if is_link_allowed(l)),
         "expired_links": sum(1 for l in snap.values() if is_link_expired(l)),
         "subs_count": len(SUBS),
+        "game_links": sum(1 for l in snap.values() if l.get("game_mode")),
     }
 
 # ── Link Management ───────────────────────────────────────────────────────────
@@ -504,6 +507,8 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "note": note,
             "is_default": False,
             "sub_id": sub_id,
+            "game_mode": False,
+            "game_port": None,
         }
 
     # if sub_id given, add to sub
@@ -520,7 +525,57 @@ async def create_link(request: Request, _=Depends(require_auth)):
         "uuid": uid,
         **LINKS[uid],
         "expired": False,
-        "vless_link": generate_vless_link(uid, host, remark=f"RVG-{label}"),
+        "vless_link": generate_vless_link(uid, host, remark=f"NexaGate-{label}"),
+        "sub_url": f"https://{host}/sub/{uid}",
+    }
+
+@app.post("/api/links/game")
+async def create_game_link(request: Request, _=Depends(require_auth)):
+    """ساخت کانفیگ مخصوص گیم — این اندپوینت قبلاً اصلاً وجود نداشت و دکمه‌ی
+    «ساخت کانفیگ گیم» در داشبورد همیشه با خطای 404 مواجه می‌شد."""
+    body = await request.json()
+    label = (body.get("label") or "کانفیگ گیم").strip()[:60]
+    lv = float(body.get("limit_value") or 0)
+    lu = body.get("limit_unit") or "MB"
+    limit_bytes = 0 if lv <= 0 else parse_size_to_bytes(lv, lu)
+
+    raw_port = body.get("game_port")
+    game_port = None
+    if raw_port not in (None, "", 0, "0"):
+        try:
+            p = int(raw_port)
+            if 1 <= p <= 65535:
+                game_port = p
+        except (TypeError, ValueError):
+            game_port = None
+
+    uid = generate_uuid()
+    async with LINKS_LOCK:
+        LINKS[uid] = {
+            "label": label,
+            "limit_bytes": limit_bytes,
+            "used_bytes": 0,
+            "created_at": datetime.now().isoformat(),
+            "active": True,
+            "expires_at": None,
+            "note": "",
+            "is_default": False,
+            "sub_id": None,
+            "game_mode": True,
+            "game_port": game_port,
+        }
+
+    asyncio.create_task(save_state())
+    host = get_host()
+    # توجه: روی Railway فقط یک پورت عمومی (443) واقعاً قابل اتصال است،
+    # بنابراین game_port صرفاً به‌عنوان برچسب/یادداشت ذخیره می‌شود و خود
+    # اتصال هم مثل بقیه‌ی کانفیگ‌ها از همان تونل اصلی (443) عبور می‌کند.
+    remark = f"NexaGate-GAME-{label}" + (f"-p{game_port}" if game_port else "")
+    return {
+        "uuid": uid,
+        **LINKS[uid],
+        "expired": False,
+        "vless_link": generate_vless_link(uid, host, remark=remark),
         "sub_url": f"https://{host}/sub/{uid}",
     }
 
@@ -531,11 +586,12 @@ async def list_links(_=Depends(require_auth)):
         snap = dict(LINKS)
     result = []
     for uid, d in snap.items():
+        remark = f"NexaGate-{d['label']}" if not d.get("game_mode") else f"NexaGate-GAME-{d['label']}"
         result.append({
             "uuid": uid,
             **d,
             "expired": is_link_expired(d),
-            "vless_link": generate_vless_link(uid, host, remark=f"RVG-{d['label']}"),
+            "vless_link": generate_vless_link(uid, host, remark=remark),
             "sub_url": f"https://{host}/sub/{uid}",
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
@@ -582,6 +638,19 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
                 if uid not in ids:
                     ids.append(uid)
 
+    asyncio.create_task(save_state())
+    return {"ok": True}
+
+@app.patch("/api/links/{uid}/sub-link")
+async def update_link_sub_link(uid: str, request: Request, _=Depends(require_auth)):
+    """تغییر sub_link سفارشی برای یک کانفیگ — این اندپوینت هم در main.py
+    قبلی وجود نداشت در حالی که داشبورد به آن نیاز دارد."""
+    body = await request.json()
+    sub_link = body.get("sub_link")
+    async with LINKS_LOCK:
+        if uid not in LINKS:
+            raise HTTPException(status_code=404, detail="link not found")
+        LINKS[uid]["sub_link"] = (str(sub_link).strip()[:300] if sub_link else None)
     asyncio.create_task(save_state())
     return {"ok": True}
 
@@ -836,9 +905,11 @@ async def public_sub_data(uuid_key: str, request: Request):
             "limit_bytes": link.get("limit_bytes", 0),
             "limit_fmt": "∞" if link.get("limit_bytes", 0) == 0 else fmt_bytes(link["limit_bytes"]),
             "expires_at": link.get("expires_at"),
-            "vless_link": generate_vless_link(lid, host, remark=f"RVG-{link['label']}"),
+            "vless_link": generate_vless_link(lid, host, remark=f"NexaGate-{link['label']}"),
             "sub_url": f"https://{host}/sub/{lid}",
             "connections": conn_count,
+            "game_mode": link.get("game_mode", False),
+            "sub_link": link.get("sub_link"),
         })
 
     total_used = sum(l["used_bytes"] for l in links_out)
