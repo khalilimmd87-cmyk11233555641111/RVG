@@ -1350,7 +1350,7 @@ function renderContent(d){{
                   ${{isGame ? '<span class="game-tag"><i class="ti ti-sword"></i> گیم</span>' : ''}}
                 </div>
                 ${{l.connections > 0 ? `<span class="conn-chip" style="margin-top:4px;display:inline-flex"><span class="dot"></span> ${{toFa(l.connections)}} اتصال</span>` : ''}}
-                ${{subLink ? `<div style="margin-top:4px;font-size:9px;color:var(--accent3);font-family:ui-monospace,monospace"><i class="ti ti-link"></i> ${esc(subLink)}</div>` : ''}}
+                ${{subLink ? `<div style="margin-top:4px;font-size:9px;color:var(--accent3);font-family:ui-monospace,monospace"><i class="ti ti-link"></i> ${{esc(subLink)}}</div>` : ''}}
               </div>
               <span class="cfg-status ${{l.active ? 'ok' : 'no'}}">${{l.active ? '<i class="ti ti-circle-check"></i> فعال' : '<i class="ti ti-circle-x"></i> غیرفعال'}}</span>
             </div>
@@ -1370,7 +1370,7 @@ function renderContent(d){{
               </button>
               ${{subLink ? `
                 <button class="btn btn-pur" style="padding:6px 12px;font-size:11px"
-                  onclick="navigator.clipboard.writeText('${esc(subLink)}').then(()=>toast('لینک ساب کپی شد','ok'))">
+                  onclick="navigator.clipboard.writeText('${{esc(subLink)}}').then(()=>toast('لینک ساب کپی شد','ok'))">
                   <i class="ti ti-link"></i> کپی ساب
                 </button>
               ` : ''}}
